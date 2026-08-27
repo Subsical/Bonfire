@@ -93,12 +93,21 @@ async def get_channel_or_fetch(bot: discord.Client, channel_id: int):
 	except (discord.NotFound, discord.Forbidden):
 		return None
 
-async def close_poll(bot: discord.Client, poll_id: int):
-	"""Marks a poll closed and redraws its message with buttons disabled."""
+async def close_poll(bot: discord.Client, poll_id: int, interaction: discord.Interaction | None = None):
+	"""Marks a poll closed and redraws its message with buttons disabled.
+	If interaction is given, tries editing through it first, since that's the one path that reliably
+	works everywhere including DMs and group chats. Falls back to a channel fetch + edit otherwise,
+	which is what the periodic expiry check and /polls close have to use since they have no interaction
+	tied to the poll's own message."""
 	channel_id, message_id, already_closed = db.get_poll_message_ref(poll_id)
 	if already_closed:
 		return
 	db.set_closed(poll_id, True)
+	view = PollView(poll_id, db.get_poll_options(poll_id), closed=True)
+
+	if interaction is not None and not interaction.response.is_done():
+		await interaction.response.edit_message(view=view)
+		return
 
 	channel = await get_channel_or_fetch(bot, channel_id)
 	if channel is None:
@@ -107,9 +116,10 @@ async def close_poll(bot: discord.Client, poll_id: int):
 		message = await channel.fetch_message(message_id)
 	except discord.NotFound:
 		return
-
-	view = PollView(poll_id, db.get_poll_options(poll_id), closed=True)
-	await message.edit(view=view)
+	try:
+		await message.edit(view=view)
+	except discord.Forbidden:
+		pass
 
 async def refresh_poll_message(bot: discord.Client, poll_id: int):
 	"""Re-renders a poll's live message. Fails silently if the message is not found."""
@@ -189,9 +199,8 @@ class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
 		await refresh_poll_message(interaction.client, self.poll_id)
 
 class ReplyButton(discord.ui.Button):
-	def __init__(self, poll_id: int, closed: bool = False, supports_replies: bool = True):
-		# disabled if the poll is closed OR it's in a DM/group chat, which have no thread type to reply into
-		super().__init__(emoji="💬", label="Reply", style=discord.ButtonStyle.primary, custom_id=f"bonfire_reply:{poll_id}", disabled=closed or not supports_replies)
+	def __init__(self, poll_id: int, closed: bool = False):
+		super().__init__(emoji="💬", label="Reply", style=discord.ButtonStyle.primary, custom_id=f"bonfire_reply:{poll_id}", disabled=closed)
 		self.poll_id = poll_id
 
 	async def callback(self, interaction: discord.Interaction):
@@ -209,8 +218,8 @@ class EndPollButton(discord.ui.Button):
 		if db.hash_voter(interaction.user.id, self.poll_id) != creator_hash:
 			await interaction.response.send_message("Only this poll's creator can end it!", ephemeral=True)
 			return
-		await close_poll(interaction.client, self.poll_id)
-		await interaction.response.send_message("Your poll has been ended.", ephemeral=True)
+		await close_poll(interaction.client, self.poll_id, interaction)
+		await interaction.followup.send("Your poll has been ended.", ephemeral=True)
 
 class PollView(discord.ui.LayoutView):
 	"""Renders the poll with Components V2."""
@@ -236,7 +245,8 @@ class PollView(discord.ui.LayoutView):
 		container.add_item(vote_row)
 
 		action_row = discord.ui.ActionRow()
-		action_row.add_item(ReplyButton(poll_id, closed, bool(supports_replies)))
+		if supports_replies:
+			action_row.add_item(ReplyButton(poll_id, closed))
 		action_row.add_item(EndPollButton(poll_id, closed))
 		container.add_item(action_row)
 

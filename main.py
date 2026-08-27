@@ -1,3 +1,6 @@
+import asyncio
+import hashlib
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -10,14 +13,46 @@ from lib import polls
 
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all(), help_command=None)
 
+SYNC_HASH_FILE = "command_sync.hash"
+
+def command_definitions_hash() -> str:
+	"""A hash of every command's current definition, so we only sync when something actually changed"""
+	payloads = [cmd.to_dict(bot.tree) for cmd in sorted(bot.tree.get_commands(), key=lambda c: c.name)]
+	return hashlib.sha256(json.dumps(payloads, sort_keys=True).encode()).hexdigest()
+
+def read_last_sync_hash() -> str | None:
+	if not os.path.exists(SYNC_HASH_FILE):
+		return None
+	with open(SYNC_HASH_FILE) as f:
+		return f.read().strip()
+
+def write_last_sync_hash(value: str):
+	with open(SYNC_HASH_FILE, "w") as f:
+		f.write(value)
+
+def filter_guild_id(interaction: discord.Interaction) -> int | None:
+	"""Which guild's polls this interaction should be scoped to. (None means all guilds, for dev testing)"""
+	if interaction.guild_id == 954760200777265162:
+		return None
+	return interaction.guild_id
+
+def jump_url(guild_id: int | None, channel_id: int, message_id: int) -> str:
+	return f"https://discord.com/channels/{guild_id or '@me'}/{channel_id}/{message_id}"
+
 ########## ======================================================================== ##########
 
 @bot.event
 async def on_ready():
-	await bot.tree.sync()
-	for guild in bot.guilds:
-		bot.tree.copy_global_to(guild=guild)
-		await bot.tree.sync(guild=guild)
+	current_hash = command_definitions_hash()
+	last_hash = await asyncio.to_thread(read_last_sync_hash)
+
+	if current_hash != last_hash:
+		await bot.tree.sync()
+		for guild in bot.guilds:
+			bot.tree.clear_commands(guild=guild)
+			await bot.tree.sync(guild=guild)
+		await asyncio.to_thread(write_last_sync_hash, current_hash)
+		print("Command definitions changed, synced with Discord.")
 
 	# reattach persistent views
 	for poll_id, options_raw, closed in db.all_poll_views_data():
@@ -29,11 +64,6 @@ async def on_ready():
 @bot.event
 async def on_resumed():
 	print("// resumed session")
-
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-	bot.tree.copy_global_to(guild=guild)
-	await bot.tree.sync(guild=guild)
 
 ########## ======================================================================== ##########
 
@@ -98,17 +128,24 @@ async def poll(
 	"""
 	options = [o for o in (option1, option2, option3, option4, option5) if o]
 	assert len(options) <= 5, "Polls can have at most 5 options."
-
-	await interaction.response.send_message("Your anonymous poll is being posted...", ephemeral=True)
+	# user-installed /poll can't post a channel message in a guild the bot itself isn't in
+	assert interaction.guild_id is None or bot.get_guild(interaction.guild_id) is not None, \
+		"Bonfire needs to be added to this server for /poll to work here."
 
 	target_channel = interaction.channel
 	supports_replies = isinstance(target_channel, discord.abc.GuildChannel)
 
 	expires_at = (datetime.now(timezone.utc) + timedelta(seconds=duration.value)).isoformat()
 	poll_id = db.create_poll(target_channel.id, interaction.user.id, question, options, expires_at, supports_replies, interaction.guild_id)
-
 	view = polls.PollView(poll_id, options)
-	poll_message = await target_channel.send(view=view)
+
+	if interaction.guild_id is not None:
+		await interaction.response.send_message("Your anonymous poll is being posted...", ephemeral=True)
+		poll_message = await target_channel.send(view=view, suppress_embeds=True)
+	else:
+		await interaction.response.send_message(view=view, suppress_embeds=True)
+		poll_message = await interaction.original_response()
+
 	db.set_message_id(poll_id, poll_message.id)
 
 ########## ======================================================================== ##########
@@ -133,11 +170,11 @@ polls_group = PollsGroup(
 bot.tree.add_command(polls_group)
 
 async def poll_id_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
-	"""Shows each poll's question alongside its ID, filtered live as you type. Only this server's polls."""
+	"""Shows each poll's question alongside its ID, filtered live as you type."""
 	if interaction.guild_id is None:
 		return []
 	choices = []
-	for poll_id, question, closed, expires_at, channel_id, message_id in db.list_polls(interaction.guild_id):
+	for poll_id, question, closed, expires_at, channel_id, message_id, guild_id in db.list_polls(filter_guild_id(interaction)):
 		label = f"#{poll_id} — {question}"
 		if current.lower() in label.lower():
 			choices.append(app_commands.Choice(name=label[:100], value=poll_id))
@@ -146,16 +183,15 @@ async def poll_id_autocomplete(interaction: discord.Interaction, current: str) -
 @polls_group.command(name="list")
 async def polls_list(interaction: discord.Interaction):
 	"""List this server's polls."""
-	rows = db.list_polls(interaction.guild_id)
+	rows = db.list_polls(filter_guild_id(interaction))
 	if not rows:
 		await interaction.response.send_message("This server has no polls yet.", ephemeral=True)
 		return
 	lines = []
-	for poll_id, question, closed, expires_at, channel_id, message_id in rows:
+	for poll_id, question, closed, expires_at, channel_id, message_id, guild_id in rows:
 		status = "closed" if closed else f"open, closes {discord.utils.format_dt(datetime.fromisoformat(expires_at), style='R')}"
-		jump_url = f"https://discord.com/channels/{interaction.guild_id}/{channel_id}/{message_id}"
-		lines.append(f"**#{poll_id}** — [{question}]({jump_url}) ({status})")
-	await interaction.response.send_message("\n".join(lines), ephemeral=True)
+		lines.append(f"**#{poll_id}** — [{question}]({jump_url(guild_id, channel_id, message_id)}) ({status})")
+	await interaction.response.send_message("\n".join(lines), suppress_embeds=True, ephemeral=True)
 
 @polls_group.command(name="view")
 @app_commands.autocomplete(poll_id=poll_id_autocomplete)
@@ -164,21 +200,21 @@ async def polls_view(interaction: discord.Interaction, poll_id: int):
 
 	:param poll_id: Which poll (start typing its name to search)
 	"""
-	row = db.get_poll(poll_id, interaction.guild_id)
+	row = db.get_poll(poll_id, filter_guild_id(interaction))
 	assert row is not None, "That poll doesn't exist in this server."
-	_, message_id, channel_id, question, options_raw, thread_id, expires_at, closed = row
+	_, message_id, channel_id, guild_id, question, options_raw, thread_id, expires_at, closed = row
 	options = options_raw.split("\x1f")
 
-	jump_url = f"https://discord.com/channels/{interaction.guild_id}/{channel_id}/{message_id}"
 	lines = [
 		f"**#{poll_id}: {question}**",
 		f"Status: {'closed' if closed else 'open'}",
 		f"Closes: {discord.utils.format_dt(datetime.fromisoformat(expires_at), style='f')}",
-		f"Message: {jump_url} • Replies thread: {f'<#{thread_id}>' if thread_id else 'none yet'}",
+		f"Message: {jump_url(guild_id, channel_id, message_id)}",
+		f"Replies thread: {f'<#{thread_id}>' if thread_id else 'none yet'}",
 		"",
 		polls.option_lines(poll_id, options),
 	]
-	await interaction.response.send_message("\n".join(lines), ephemeral=True)
+	await interaction.response.send_message("\n".join(lines), suppress_embeds=True, ephemeral=True)
 
 @polls_group.command(name="edit")
 @app_commands.autocomplete(poll_id=poll_id_autocomplete)
@@ -194,9 +230,9 @@ async def polls_edit(interaction: discord.Interaction, poll_id: int, question: s
 	:param option5: Replace option 5 with this
 	:param extend_minutes: Add this many minutes to the poll's closing time (use a negative number to make it close sooner)
 	"""
-	row = db.get_poll(poll_id, interaction.guild_id)
+	row = db.get_poll(poll_id, filter_guild_id(interaction))
 	assert row is not None, "That poll doesn't exist in this server."
-	_, _, _, _, options_raw, _, expires_at, _ = row
+	_, _, _, _, _, options_raw, _, expires_at, _ = row
 
 	if question is not None:
 		db.set_question(poll_id, question)
@@ -224,7 +260,7 @@ async def polls_close(interaction: discord.Interaction, poll_id: int):
 
 	:param poll_id: Which poll (start typing its name to search)
 	"""
-	assert db.get_poll(poll_id, interaction.guild_id) is not None, "That poll doesn't exist in this server."
+	assert db.get_poll(poll_id, filter_guild_id(interaction)) is not None, "That poll doesn't exist in this server."
 	await polls.close_poll(bot, poll_id)
 	await interaction.response.send_message(f"Poll #{poll_id} closed.", ephemeral=True)
 
@@ -237,12 +273,22 @@ async def polls_reopen(interaction: discord.Interaction, poll_id: int, duration:
 	:param poll_id: Which poll (start typing its name to search)
 	:param duration: How much longer it should stay open, starting now
 	"""
-	assert db.get_poll(poll_id, interaction.guild_id) is not None, "That poll doesn't exist in this server."
+	assert db.get_poll(poll_id, filter_guild_id(interaction)) is not None, "That poll doesn't exist in this server."
 	new_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=duration.value)).isoformat()
 	db.set_expires_at(poll_id, new_expires_at)
 	db.set_closed(poll_id, False)
 	await polls.refresh_poll_message(bot, poll_id)
 	await interaction.response.send_message(f"Poll #{poll_id} reopened.", ephemeral=True)
+
+########## ======================================================================== ##########
+
+@bot.command(name="deletepoll")
+@commands.is_owner()
+async def deletepoll(ctx: commands.Context, poll_id: int):
+	"""Deletes a poll from the database."""
+	assert db.get_poll(poll_id, None) is not None, f"No poll with ID {poll_id}."
+	db.delete_poll(poll_id)
+	await ctx.send(f"Poll #{poll_id} deleted.")
 
 ########## ======================================================================== ##########
 

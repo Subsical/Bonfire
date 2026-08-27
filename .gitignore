@@ -3,3 +3,4 @@ __pycache__/
 *.db
 *.pyc
 Dockerfile
+command_sync.hash

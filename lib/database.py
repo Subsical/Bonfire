@@ -60,10 +60,11 @@ def hash_voter(user_id: int, poll_id: int) -> str:
 ########## ======================================================================== ##########
 
 def create_poll(channel_id: int, creator_id: int, question: str, options: list[str], expires_at: str, supports_replies: bool = True, guild_id: int | None = None) -> int:
-	"""Inserts a new poll and returns its poll_id."""
+	"""Inserts a new poll and returns its poll_id. message_id starts NULL, not 0, so a failed poll
+	can't block a later one via the UNIQUE constraint."""
 	cur.execute(
 		"INSERT INTO Polls (message_id, channel_id, guild_id, question, options, creator_hash, expires_at, supports_replies) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		(0, channel_id, guild_id, question, "\x1f".join(options), "", expires_at, int(supports_replies))
+		(None, channel_id, guild_id, question, "\x1f".join(options), "", expires_at, int(supports_replies))
 	)
 	poll_id = cur.lastrowid
 	cur.execute("UPDATE Polls SET creator_hash = ? WHERE poll_id = ?", (hash_voter(creator_id, poll_id), poll_id))
@@ -84,9 +85,12 @@ def expired_poll_ids() -> list[int]:
 	cur.execute("SELECT poll_id FROM Polls WHERE closed = 0 AND expires_at <= ?", (now_iso,))
 	return [poll_id for poll_id, in cur.fetchall()]
 
-def get_poll(poll_id: int, guild_id: int):
-	"""Only returns a poll if it belongs to the given guild"""
-	cur.execute("SELECT poll_id, message_id, channel_id, question, options, thread_id, expires_at, closed FROM Polls WHERE poll_id = ? AND guild_id = ?", (poll_id, guild_id))
+def get_poll(poll_id: int, guild_id: int | None):
+	"""Only returns a poll if it belongs to the given guild. guild_id=None skips that filter (cross-server admin override only)."""
+	if guild_id is None:
+		cur.execute("SELECT poll_id, message_id, channel_id, guild_id, question, options, thread_id, expires_at, closed FROM Polls WHERE poll_id = ?", (poll_id,))
+	else:
+		cur.execute("SELECT poll_id, message_id, channel_id, guild_id, question, options, thread_id, expires_at, closed FROM Polls WHERE poll_id = ? AND guild_id = ?", (poll_id, guild_id))
 	return cur.fetchone()
 
 def get_poll_render_data(poll_id: int):
@@ -119,9 +123,12 @@ def get_poll_creator_hash(poll_id: int) -> str:
 	creator_hash, = cur.fetchone()
 	return creator_hash
 
-def list_polls(guild_id: int) -> list[tuple]:
-	"""Only lists polls belonging to the given guild."""
-	cur.execute("SELECT poll_id, question, closed, expires_at, channel_id, message_id FROM Polls WHERE guild_id = ? ORDER BY poll_id DESC", (guild_id,))
+def list_polls(guild_id: int | None) -> list[tuple]:
+	"""Only lists polls belonging to the given guild. guild_id=None lists every guild's polls. Each row includes its own guild_id for building jump links."""
+	if guild_id is None:
+		cur.execute("SELECT poll_id, question, closed, expires_at, channel_id, message_id, guild_id FROM Polls ORDER BY poll_id DESC")
+	else:
+		cur.execute("SELECT poll_id, question, closed, expires_at, channel_id, message_id, guild_id FROM Polls WHERE guild_id = ? ORDER BY poll_id DESC", (guild_id,))
 	return cur.fetchall()
 
 def is_closed(poll_id: int) -> bool:
