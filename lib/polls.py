@@ -83,6 +83,16 @@ def status_line(poll_id: int, expires_at: str, closed: bool) -> str:
 
 ########## ======================================================================== ##########
 
+async def get_channel_or_fetch(bot: discord.Client, channel_id: int):
+	"""bot.get_channel is cache-only so fall back to an actual API call if it isn't found"""
+	channel = bot.get_channel(channel_id)
+	if channel is not None:
+		return channel
+	try:
+		return await bot.fetch_channel(channel_id)
+	except (discord.NotFound, discord.Forbidden):
+		return None
+
 async def close_poll(bot: discord.Client, poll_id: int):
 	"""Marks a poll closed and redraws its message with buttons disabled."""
 	channel_id, message_id, already_closed = db.get_poll_message_ref(poll_id)
@@ -90,7 +100,7 @@ async def close_poll(bot: discord.Client, poll_id: int):
 		return
 	db.set_closed(poll_id, True)
 
-	channel = bot.get_channel(channel_id)
+	channel = await get_channel_or_fetch(bot, channel_id)
 	if channel is None:
 		return
 	try:
@@ -107,7 +117,7 @@ async def refresh_poll_message(bot: discord.Client, poll_id: int):
 	if ref is None:
 		return
 	channel_id, message_id, closed = ref
-	channel = bot.get_channel(channel_id)
+	channel = await get_channel_or_fetch(bot, channel_id)
 	if channel is None:
 		return
 	try:
@@ -121,7 +131,7 @@ async def rename_reply_thread(bot: discord.Client, poll_id: int):
 	_, thread_id, question = db.get_poll_reply_thread(poll_id)
 	if thread_id is None:
 		return
-	thread = bot.get_channel(thread_id)
+	thread = await get_channel_or_fetch(bot, thread_id)
 	if thread is None:
 		return
 	try:
@@ -156,12 +166,16 @@ class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
 		if db.is_closed(self.poll_id):
 			await interaction.response.send_message("This poll is closed and no longer accepting replies.", ephemeral=True)
 			return
+		_, _, supports_replies = db.get_poll_render_data(self.poll_id)
+		if not supports_replies:
+			await interaction.response.send_message("Replies aren't available for polls posted in a DM or group chat.", ephemeral=True)
+			return
 
 		channel_id, thread_id, question = db.get_poll_reply_thread(self.poll_id)
 
-		thread = interaction.client.get_channel(thread_id) if thread_id else None
+		thread = await get_channel_or_fetch(interaction.client, thread_id) if thread_id else None
 		if thread is None:
-			channel = interaction.client.get_channel(channel_id)
+			channel = await get_channel_or_fetch(interaction.client, channel_id)
 			# standalone thread, not directly attached to the poll message (it looks ugly otherwise)
 			thread = await channel.create_thread(name=f"Replies: {question}"[:100], type=discord.ChannelType.public_thread)
 			db.set_thread_id(self.poll_id, thread.id)
@@ -175,8 +189,9 @@ class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
 		await refresh_poll_message(interaction.client, self.poll_id)
 
 class ReplyButton(discord.ui.Button):
-	def __init__(self, poll_id: int, closed: bool = False):
-		super().__init__(emoji="💬", label="Reply", style=discord.ButtonStyle.primary, custom_id=f"bonfire_reply:{poll_id}", disabled=closed)
+	def __init__(self, poll_id: int, closed: bool = False, supports_replies: bool = True):
+		# disabled if the poll is closed OR it's in a DM/group chat, which have no thread type to reply into
+		super().__init__(emoji="💬", label="Reply", style=discord.ButtonStyle.primary, custom_id=f"bonfire_reply:{poll_id}", disabled=closed or not supports_replies)
 		self.poll_id = poll_id
 
 	async def callback(self, interaction: discord.Interaction):
@@ -203,7 +218,7 @@ class PollView(discord.ui.LayoutView):
 	def __init__(self, poll_id: int, options: list[str], closed: bool = False):
 		super().__init__(timeout=None)
 
-		question, expires_at = db.get_poll_render_data(poll_id)
+		question, expires_at, supports_replies = db.get_poll_render_data(poll_id)
 
 		heading = "###" if len(question) > 30 else "##"
 		container = discord.ui.Container(accent_color=COLOR_MAIN_DARK if closed else COLOR_MAIN)
@@ -221,7 +236,7 @@ class PollView(discord.ui.LayoutView):
 		container.add_item(vote_row)
 
 		action_row = discord.ui.ActionRow()
-		action_row.add_item(ReplyButton(poll_id, closed))
+		action_row.add_item(ReplyButton(poll_id, closed, bool(supports_replies)))
 		action_row.add_item(EndPollButton(poll_id, closed))
 		container.add_item(action_row)
 

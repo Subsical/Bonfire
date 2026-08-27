@@ -13,6 +13,7 @@ cur.execute("""
 		poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
 		message_id INTEGER UNIQUE,
 		channel_id INTEGER NOT NULL,
+		guild_id INTEGER,
 		question TEXT NOT NULL,
 		options TEXT NOT NULL,
 		thread_id INTEGER,
@@ -21,7 +22,8 @@ cur.execute("""
 		closed INTEGER NOT NULL DEFAULT 0,
 		reply_count INTEGER NOT NULL DEFAULT 0,
 		last_reply TEXT,
-		last_reply_at TEXT
+		last_reply_at TEXT,
+		supports_replies INTEGER NOT NULL DEFAULT 1
 	)
 """)
 cur.execute("""
@@ -36,7 +38,13 @@ conn.commit()
 
 cur.execute("PRAGMA table_info(Polls)")
 existing_columns = {row[1] for row in cur.fetchall()}
-for column, definition in [("reply_count", "INTEGER NOT NULL DEFAULT 0"), ("last_reply", "TEXT"), ("last_reply_at", "TEXT")]:
+for column, definition in [
+	("reply_count", "INTEGER NOT NULL DEFAULT 0"),
+	("last_reply", "TEXT"),
+	("last_reply_at", "TEXT"),
+	("supports_replies", "INTEGER NOT NULL DEFAULT 1"),
+	("guild_id", "INTEGER"),
+]:
 	if column not in existing_columns:
 		cur.execute(f"ALTER TABLE Polls ADD COLUMN {column} {definition}")
 conn.commit()
@@ -51,11 +59,11 @@ def hash_voter(user_id: int, poll_id: int) -> str:
 
 ########## ======================================================================== ##########
 
-def create_poll(channel_id: int, creator_id: int, question: str, options: list[str], expires_at: str) -> int:
-	"""Inserts a new poll and returns its poll_id. The creator's hash depends on poll_id, so it's computed after the insert and patched in."""
+def create_poll(channel_id: int, creator_id: int, question: str, options: list[str], expires_at: str, supports_replies: bool = True, guild_id: int | None = None) -> int:
+	"""Inserts a new poll and returns its poll_id."""
 	cur.execute(
-		"INSERT INTO Polls (message_id, channel_id, question, options, creator_hash, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-		(0, channel_id, question, "\x1f".join(options), "", expires_at)
+		"INSERT INTO Polls (message_id, channel_id, guild_id, question, options, creator_hash, expires_at, supports_replies) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		(0, channel_id, guild_id, question, "\x1f".join(options), "", expires_at, int(supports_replies))
 	)
 	poll_id = cur.lastrowid
 	cur.execute("UPDATE Polls SET creator_hash = ? WHERE poll_id = ?", (hash_voter(creator_id, poll_id), poll_id))
@@ -67,7 +75,7 @@ def set_message_id(poll_id: int, message_id: int):
 	conn.commit()
 
 def all_poll_views_data() -> list[tuple]:
-	"""(poll_id, options, closed) for every stored poll -- used to reattach persistent views on startup."""
+	"""Gets (poll_id, options, closed) for every stored poll, used to reattach persistent views on startup"""
 	cur.execute("SELECT poll_id, options, closed FROM Polls")
 	return cur.fetchall()
 
@@ -76,17 +84,18 @@ def expired_poll_ids() -> list[int]:
 	cur.execute("SELECT poll_id FROM Polls WHERE closed = 0 AND expires_at <= ?", (now_iso,))
 	return [poll_id for poll_id, in cur.fetchall()]
 
-def get_poll(poll_id: int):
-	cur.execute("SELECT poll_id, message_id, channel_id, question, options, thread_id, expires_at, closed FROM Polls WHERE poll_id = ?", (poll_id,))
+def get_poll(poll_id: int, guild_id: int):
+	"""Only returns a poll if it belongs to the given guild"""
+	cur.execute("SELECT poll_id, message_id, channel_id, question, options, thread_id, expires_at, closed FROM Polls WHERE poll_id = ? AND guild_id = ?", (poll_id, guild_id))
 	return cur.fetchone()
 
 def get_poll_render_data(poll_id: int):
-	"""(question, expires_at) -- just what PollView needs to render, without the caller pulling the whole row apart."""
-	cur.execute("SELECT question, expires_at FROM Polls WHERE poll_id = ?", (poll_id,))
+	"""Gets (question, expires_at, supports_replies) which is what PollView needs to render"""
+	cur.execute("SELECT question, expires_at, supports_replies FROM Polls WHERE poll_id = ?", (poll_id,))
 	return cur.fetchone()
 
 def get_poll_message_ref(poll_id: int):
-	"""(channel_id, message_id, closed) -- for redrawing a poll's live Discord message."""
+	"""Gets (channel_id, message_id, closed) for redrawing a poll's live Discord message"""
 	cur.execute("SELECT channel_id, message_id, closed FROM Polls WHERE poll_id = ?", (poll_id,))
 	return cur.fetchone()
 
@@ -96,12 +105,12 @@ def get_poll_options(poll_id: int) -> list[str]:
 	return options_raw.split("\x1f")
 
 def get_poll_reply_thread(poll_id: int):
-	"""(channel_id, thread_id, question) -- for the reply modal, to find or create the replies thread."""
+	"""Gets (channel_id, thread_id, question) for the reply modal, to find or create the replies thread."""
 	cur.execute("SELECT channel_id, thread_id, question FROM Polls WHERE poll_id = ?", (poll_id,))
 	return cur.fetchone()
 
 def get_poll_reply_preview(poll_id: int):
-	"""(reply_count, last_reply, last_reply_at) -- for the reply-preview card."""
+	"""Gets (reply_count, last_reply, last_reply_at) for the reply-preview card."""
 	cur.execute("SELECT reply_count, last_reply, last_reply_at FROM Polls WHERE poll_id = ?", (poll_id,))
 	return cur.fetchone()
 
@@ -110,8 +119,9 @@ def get_poll_creator_hash(poll_id: int) -> str:
 	creator_hash, = cur.fetchone()
 	return creator_hash
 
-def list_polls() -> list[tuple]:
-	cur.execute("SELECT poll_id, question, closed, expires_at, channel_id, message_id FROM Polls ORDER BY poll_id DESC")
+def list_polls(guild_id: int) -> list[tuple]:
+	"""Only lists polls belonging to the given guild."""
+	cur.execute("SELECT poll_id, question, closed, expires_at, channel_id, message_id FROM Polls WHERE guild_id = ? ORDER BY poll_id DESC", (guild_id,))
 	return cur.fetchall()
 
 def is_closed(poll_id: int) -> bool:
