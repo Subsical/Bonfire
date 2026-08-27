@@ -1,3 +1,4 @@
+import traceback
 from datetime import datetime, timezone
 
 import discord
@@ -100,13 +101,14 @@ async def close_poll(bot: discord.Client, poll_id: int, interaction: discord.Int
 	which is what the periodic expiry check and /polls close have to use since they have no interaction
 	tied to the poll's own message."""
 	channel_id, message_id, already_closed = db.get_poll_message_ref(poll_id)
-	if already_closed:
-		return
-	db.set_closed(poll_id, True)
+	if not already_closed:
+		db.set_closed(poll_id, True)
 	view = PollView(poll_id, db.get_poll_options(poll_id), closed=True)
 
 	if interaction is not None and not interaction.response.is_done():
 		await interaction.response.edit_message(view=view)
+		return
+	if already_closed:
 		return
 
 	channel = await get_channel_or_fetch(bot, channel_id)
@@ -159,7 +161,8 @@ class VoteButton(discord.ui.Button):
 
 	async def callback(self, interaction: discord.Interaction):
 		if db.is_closed(self.poll_id):
-			await interaction.response.send_message("This poll is closed and no longer accepting votes.", ephemeral=True)
+			await interaction.response.edit_message(view=PollView(self.poll_id, db.get_poll_options(self.poll_id), closed=True))
+			await interaction.followup.send("This poll is closed and no longer accepting votes.", ephemeral=True)
 			return
 		voter_hash = db.hash_voter(interaction.user.id, self.poll_id)
 		db.cast_vote(self.poll_id, voter_hash, self.option_index)
@@ -175,6 +178,7 @@ class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
 	async def on_submit(self, interaction: discord.Interaction):
 		if db.is_closed(self.poll_id):
 			await interaction.response.send_message("This poll is closed and no longer accepting replies.", ephemeral=True)
+			await refresh_poll_message(interaction.client, self.poll_id)
 			return
 		_, _, supports_replies = db.get_poll_render_data(self.poll_id)
 		if not supports_replies:
@@ -197,6 +201,13 @@ class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
 
 		await interaction.response.defer()
 		await refresh_poll_message(interaction.client, self.poll_id)
+
+	async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+		traceback.print_exception(type(error), error, error.__traceback__)
+		if not interaction.response.is_done():
+			await interaction.response.send_message("Something went wrong, try again.", ephemeral=True)
+		else:
+			await interaction.followup.send("Something went wrong, try again.", ephemeral=True)
 
 class ReplyButton(discord.ui.Button):
 	def __init__(self, poll_id: int, closed: bool = False):
@@ -251,3 +262,10 @@ class PollView(discord.ui.LayoutView):
 		container.add_item(action_row)
 
 		self.add_item(container)
+
+	async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+		traceback.print_exception(type(error), error, error.__traceback__)
+		if not interaction.response.is_done():
+			await interaction.response.send_message("Something went wrong, try again.", ephemeral=True)
+		else:
+			await interaction.followup.send("Something went wrong, try again.", ephemeral=True)
