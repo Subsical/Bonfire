@@ -96,10 +96,7 @@ async def get_channel_or_fetch(bot: discord.Client, channel_id: int):
 
 async def close_poll(bot: discord.Client, poll_id: int, interaction: discord.Interaction | None = None):
 	"""Marks a poll closed and redraws its message with buttons disabled.
-	If interaction is given, tries editing through it first, since that's the one path that reliably
-	works everywhere including DMs and group chats. Falls back to a channel fetch + edit otherwise,
-	which is what the periodic expiry check and /polls close have to use since they have no interaction
-	tied to the poll's own message."""
+	Tries editing through interaction first, falls back to a channel fetch + edit otherwise."""
 	channel_id, message_id, already_closed = db.get_poll_message_ref(poll_id)
 	if not already_closed:
 		db.set_closed(poll_id, True)

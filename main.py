@@ -14,10 +14,12 @@ from lib import polls
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all(), help_command=None)
 
 SYNC_HASH_FILE = "command_sync.hash"
+DEV_GUILD = discord.Object(id=954760200777265162)
 
 def command_definitions_hash() -> str:
 	"""A hash of every command's current definition, so we only sync when something actually changed"""
-	payloads = [cmd.to_dict(bot.tree) for cmd in sorted(bot.tree.get_commands(), key=lambda c: c.name)]
+	all_commands = bot.tree.get_commands() + bot.tree.get_commands(guild=DEV_GUILD)
+	payloads = [cmd.to_dict(bot.tree) for cmd in sorted(all_commands, key=lambda c: c.name)]
 	return hashlib.sha256(json.dumps(payloads, sort_keys=True).encode()).hexdigest()
 
 def read_last_sync_hash() -> str | None:
@@ -32,7 +34,7 @@ def write_last_sync_hash(value: str):
 
 def filter_guild_id(interaction: discord.Interaction) -> int | None:
 	"""Which guild's polls this interaction should be scoped to. (None means all guilds, for dev testing)"""
-	if interaction.guild_id == 954760200777265162:
+	if interaction.guild_id == DEV_GUILD.id:
 		return None
 	return interaction.guild_id
 
@@ -49,8 +51,11 @@ async def on_ready():
 	if current_hash != last_hash:
 		await bot.tree.sync()
 		for guild in bot.guilds:
+			if guild.id == DEV_GUILD.id:
+				continue
 			bot.tree.clear_commands(guild=guild)
 			await bot.tree.sync(guild=guild)
+		await bot.tree.sync(guild=DEV_GUILD)
 		await asyncio.to_thread(write_last_sync_hash, current_hash)
 		print("Command definitions changed, synced with Discord.")
 
@@ -282,13 +287,17 @@ async def polls_reopen(interaction: discord.Interaction, poll_id: int, duration:
 
 ########## ======================================================================== ##########
 
-@bot.command(name="deletepoll")
-@commands.is_owner()
-async def deletepoll(ctx: commands.Context, poll_id: int):
-	"""Deletes a poll from the database."""
+@bot.tree.command(name="deletepoll", guild=DEV_GUILD)
+@app_commands.autocomplete(poll_id=poll_id_autocomplete)
+async def deletepoll(interaction: discord.Interaction, poll_id: int):
+	"""Delete a poll from the database. (owner only)
+
+	:param poll_id: Which poll (type its name to search)
+	"""
+	assert await bot.is_owner(interaction.user), "Only the bot owner can use this."
 	assert db.get_poll(poll_id, None) is not None, f"No poll with ID {poll_id}."
 	db.delete_poll(poll_id)
-	await ctx.send(f"Poll #{poll_id} deleted.")
+	await interaction.response.send_message(f"Poll #{poll_id} deleted.", ephemeral=True)
 
 ########## ======================================================================== ##########
 
