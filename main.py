@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from lib import database as db
-from lib import media, polls
+from lib import media, polls, userinfo
 
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all(), help_command=None)
 
@@ -99,7 +99,10 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-	if isinstance(error.original, AssertionError):
+	# cooldowns are raised before the command runs, so there's no .original on them
+	if isinstance(error, app_commands.CommandOnCooldown):
+		await interaction.response.send_message(f"Slow down! Try again in {error.retry_after:.1f}s.", ephemeral=True)
+	elif isinstance(getattr(error, "original", None), AssertionError):
 		await interaction.response.send_message(str(error.original), ephemeral=True)
 	else:
 		raise error
@@ -381,10 +384,87 @@ async def togif(
 	view = discord.ui.LayoutView(timeout=None)
 	container = discord.ui.Container(accent_color=polls.COLOR_MAIN)
 	container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{name}", spoiler=spoiler)))
-	container.add_item(discord.ui.TextDisplay(f"-# {len(gif) / (1024 * 1024):.2f}MB  •  {name}"))
+	container.add_item(discord.ui.TextDisplay(f"-# {len(gif) / (1024 * 1024):.2f}MB • {name}"))
 	view.add_item(container)
 
 	await interaction.followup.send(view=view, file=discord.File(io.BytesIO(gif), filename=name))
+
+########## ======================================================================== ##########
+
+@bot.tree.command(name="userinfo")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.checks.cooldown(1, 2.0, key=lambda i: i.user.id)
+async def userinfo_command(interaction: discord.Interaction, user: discord.User | None = None):
+	"""Look up someone's profile images, badges and account details.
+
+	:param user: Who to look up (defaults to you)
+	"""
+	await interaction.response.defer()
+
+	# the cached user object has no banner or accent colour, so always refetch
+	target = await bot.fetch_user((user or interaction.user).id)
+	member = interaction.guild.get_member(target.id) if interaction.guild else None
+
+	badges = userinfo.user_badges(target)
+	boost = userinfo.boost_badge(member) if member else None
+	if boost:
+		badges.append(boost)
+
+	container = discord.ui.Container(accent_color=target.accent_color or polls.COLOR_MAIN)
+
+	title = target.display_name if target.display_name == target.name else f"{target.display_name} ({target.name})"
+	header = [discord.ui.TextDisplay(f"## [{title}](https://discord.com/users/{target.id})\n{target.mention}")]
+	if badges:
+		header.append(discord.ui.TextDisplay(f"\n# {' '.join(badges)}"))
+
+	avatar = member.guild_avatar if member is not None and member.guild_avatar is not None else target.display_avatar
+	container.add_item(discord.ui.Section(*header, accessory=discord.ui.Thumbnail(userinfo.full_size(avatar), description="Avatar")))
+
+	container.add_item(discord.ui.Separator())
+	lines = [f"**Created:** {discord.utils.format_dt(target.created_at, style='D')} ({discord.utils.format_dt(target.created_at, style='R')})"]
+	if member is not None:
+		if member.joined_at:
+			lines.append(f"**Joined:** {discord.utils.format_dt(member.joined_at, style='D')} ({discord.utils.format_dt(member.joined_at, style='R')})")
+		if member.premium_since:
+			lines.append(f"**Boosting since:** {discord.utils.format_dt(member.premium_since, style='D')}")
+	if target.accent_color:
+		lines.append(f"**Accent:** `{target.accent_color!s}`")
+	if member is not None:
+		lines += userinfo.member_summary(member)
+
+	details = discord.ui.TextDisplay("\n".join(lines))
+	if target.avatar_decoration is not None:
+		container.add_item(discord.ui.Section(details, accessory=discord.ui.Thumbnail(
+			userinfo.full_size(target.avatar_decoration), description="Avatar decoration")))
+	else:
+		container.add_item(details)
+
+	if member is not None:
+		container.add_item(discord.ui.Separator())
+		container.add_item(discord.ui.TextDisplay(f"**Roles**\n{userinfo.role_list(member)}"))
+		container.add_item(discord.ui.TextDisplay(f"**Key permissions**\n-# {userinfo.key_permissions(member)}"))
+
+	links = [("Avatar", target.display_avatar)]
+	if member is not None and member.guild_avatar is not None:
+		links.append(("Server avatar", member.guild_avatar))
+	if target.avatar_decoration is not None:
+		links.append(("Decoration", target.avatar_decoration))
+	if target.banner is not None:
+		links.append(("Banner", target.banner))
+
+	container.add_item(discord.ui.Separator())
+
+	assets = " • ".join(f"[{label}]({userinfo.full_size(asset)})" for label, asset in links)
+	container.add_item(discord.ui.TextDisplay(f"-# {assets}"))
+
+	# banner last and on its own, so it keeps its own wide aspect ratio
+	if target.banner is not None:
+		container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(userinfo.full_size(target.banner), description="Banner")))
+
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	await interaction.followup.send(view=view, allowed_mentions=discord.abc.AllowedMentions.none())
 
 ########## ======================================================================== ##########
 
