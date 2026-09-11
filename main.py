@@ -1,15 +1,18 @@
 import asyncio
 import hashlib
+import io
 import json
 import os
+import traceback
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from lib import database as db
-from lib import polls
+from lib import media, polls
 
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all(), help_command=None)
 
@@ -298,6 +301,90 @@ async def deletepoll(interaction: discord.Interaction, poll_id: int):
 	assert db.get_poll(poll_id, None) is not None, f"No poll with ID {poll_id}."
 	db.delete_poll(poll_id)
 	await interaction.response.send_message(f"Poll #{poll_id} deleted.", ephemeral=True)
+
+########## ======================================================================== ##########
+
+@bot.tree.command(name="togif")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.choices(
+	quality=[app_commands.Choice(name="High (bigger file)", value=100), app_commands.Choice(name="Good (default)", value=90), app_commands.Choice(name="Medium", value=70), app_commands.Choice(name="Low (smallest file)", value=50)],
+	width=[app_commands.Choice(name="Original", value=0), app_commands.Choice(name="1280px", value=1280), app_commands.Choice(name="800px (default)", value=800), app_commands.Choice(name="480px", value=480), app_commands.Choice(name="320px", value=320)],
+)
+async def togif(
+	interaction: discord.Interaction,
+	file: discord.Attachment | None = None,
+	link: str | None = None,
+	quality: app_commands.Choice[int] | None = None,
+	width: app_commands.Choice[int] | None = None,
+	fps: app_commands.Range[int, 1, 50] | None = None,
+	start: app_commands.Range[float, 0, 86400] | None = None,
+	duration: app_commands.Range[float, 0.1, float(media.MAX_GIF_SECONDS)] | None = None,
+	speed: app_commands.Range[float, 0.25, 5.0] | None = None,
+	reverse: bool = False,
+	loop: bool = True,
+	spoiler: bool = False,
+):
+	"""Convert an image or video into a GIF.
+
+	:param file: The image or video to convert
+	:param link: A direct link to an image or video, instead of uploading one
+	:param quality: How much detail to keep (lower means a smaller file)
+	:param width: Width of the GIF, in pixels. Doesn't upscale past the original
+	:param fps: Frames per second (defaults to match)
+	:param start: Skip this many seconds into the video before converting
+	:param duration: How many seconds of the video to convert
+	:param speed: Playback speed (defaults to x1)
+	:param reverse: Play the result backwards
+	:param loop: Whether the GIF loops forever
+	:param spoiler: Send the GIF as a spoiler
+	"""
+	assert file is not None or link is not None, "You need to provide a file or link to convert to GIF!"
+
+	if file is not None:
+		suffix = os.path.splitext(file.filename)[1].lower()
+		assert suffix in media.MEDIA_EXTENSIONS, "That file isn't an image or video I can convert."
+		assert file.size <= media.MAX_SOURCE_BYTES, f"That file is too big to convert (max {media.MAX_SOURCE_BYTES // (1024*1024)}MB)."
+
+	assert not media.queue_full(), "Converting too many files right now, please try again in a minute."
+
+	await interaction.response.defer()
+
+	if file is not None:
+		source_name, data = file.filename, await file.read()
+	else:
+		data, suffix, error = await media.download(link, media.MAX_SOURCE_BYTES)
+		if data is None:
+			await interaction.followup.send(error, ephemeral=True)
+			return
+		source_name = os.path.basename(urlparse(link).path) or "converted"
+
+	try:
+		gif, error = await media.to_gif(
+			data, suffix, media.upload_limit(interaction),
+			fps=fps, width=(width.value if width else None) or None,
+			quality=quality.value if quality else 90,
+			start=start, duration=duration, reverse=reverse, loop_forever=loop, speed=speed or 1.0,
+		)
+	except Exception:
+		traceback.print_exc()
+		gif, error = None, "Something went wrong while converting that file."
+
+	if gif is None:
+		await interaction.followup.send(error, ephemeral=True)
+		return
+
+	# sanitizing file name as plain ascii
+	base = "".join(c for c in os.path.splitext(source_name)[0].lstrip(".") if c.isascii() and (c.isalnum() or c in "-_"))
+	name = f"{base[:60] or 'converted'}.gif"
+
+	view = discord.ui.LayoutView(timeout=None)
+	container = discord.ui.Container(accent_color=polls.COLOR_MAIN)
+	container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{name}", spoiler=spoiler)))
+	container.add_item(discord.ui.TextDisplay(f"-# {len(gif) / (1024 * 1024):.2f}MB  •  {name}"))
+	view.add_item(container)
+
+	await interaction.followup.send(view=view, file=discord.File(io.BytesIO(gif), filename=name))
 
 ########## ======================================================================== ##########
 
