@@ -62,6 +62,8 @@ FONT_PATHS = [
 	os.path.join(ASSETS, "NotoSansKR-Bold.otf"),
 	os.path.join(ASSETS, "NotoSansSC-Bold.otf"),
 ]
+EMOJI_PATH = os.path.join(ASSETS, "NotoColorEmoji.ttf")
+EMOJI_STRIKE = 109
 
 @functools.lru_cache(maxsize=256)
 def _font(size: int, path: str | None = None) -> ImageFont.FreeTypeFont:
@@ -75,29 +77,72 @@ def _covers(path: str, char: str) -> bool:
 	"""Whether a font has a real glyph for this character, rather than an empty box."""
 	if not os.path.exists(path):
 		return False
-	font = _font(40, path)
+	# the emoji font is a bitmap and only opens at its own strike size
+	font = _font(EMOJI_STRIKE if path == EMOJI_PATH else 40, path)
 	glyph, missing = font.getmask(char), font.getmask("\uffff")
 	return bytes(glyph) != bytes(missing) if glyph.size == missing.size else True
 
-def _runs(text: str, size: int) -> list[tuple[ImageFont.FreeTypeFont, str]]:
-	"""Split text into chunks, each with the first font that can actually draw it."""
+def _is_emoji(char: str) -> bool:
+	"""Characters the emoji font should draw, rather than any of the text fonts."""
+	return not char.isascii() and _covers(EMOJI_PATH, char)
+
+@functools.lru_cache(maxsize=512)
+def _emoji_image(char: str, height: int) -> Image.Image | None:
+	"""One emoji drawn at its native size and scaled down to `height`."""
+	font = _font(EMOJI_STRIKE, EMOJI_PATH)
+	canvas = Image.new("RGBA", (EMOJI_STRIKE * 2, EMOJI_STRIKE * 2), (0, 0, 0, 0))
+	ImageDraw.Draw(canvas).text((EMOJI_STRIKE // 4, EMOJI_STRIKE // 4), char, font=font, embedded_color=True)
+	box = canvas.getbbox()
+	if box is None:
+		return None
+	glyph = canvas.crop(box)
+	width = max(1, round(glyph.width * height / glyph.height))
+	return glyph.resize((width, height), Image.LANCZOS)
+
+def _emoji_height(font: ImageFont.FreeTypeFont, alone: bool = False) -> int:
+	"""Emojis are sized against the cap height so they sit level with the letters."""
+	ascent = font.getmetrics()[0]
+	cap = ascent - font.getbbox("H")[1]
+	return max(1, round(cap * (2.2 if alone else 1.35)))
+
+def _runs(text: str, size: int) -> list[tuple[ImageFont.FreeTypeFont | None, str]]:
+	"""Split text into chunks by the font that can draw them."""
 	chunks: list[list] = []
 	for char in text:
-		path = next((p for p in FONT_PATHS if _covers(p, char)), FONT_PATHS[0])
+		path = None if _is_emoji(char) else next((p for p in FONT_PATHS if _covers(p, char)), FONT_PATHS[0])
 		if chunks and chunks[-1][0] == path:
 			chunks[-1][1].append(char)
 		else:
 			chunks.append([path, [char]])
-	return [(_font(size, path), "".join(cs)) for path, cs in chunks]
+	return [(_font(size, path) if path else None, "".join(cs)) for path, cs in chunks]
 
 def _measure(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> float:
-	return sum(draw.textlength(chunk, font=f) for f, chunk in _runs(text, font.size))
+	total = 0.0
+	alone = all(_is_emoji(c) or c.isspace() for c in text)
+	for chunk_font, chunk in _runs(text, font.size):
+		if chunk_font is None:
+			height = _emoji_height(font, alone)
+			total += sum((_emoji_image(c, height).width + 2) for c in chunk if _emoji_image(c, height))
+		else:
+			total += draw.textlength(chunk, font=chunk_font)
+	return total
 
 def _draw_text(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, font: ImageFont.FreeTypeFont, fill):
 	x, y = xy
+	baseline = y + font.getmetrics()[0]
+	alone = all(_is_emoji(c) or c.isspace() for c in text)
 	for chunk_font, chunk in _runs(text, font.size):
-		draw.text((x, y), chunk, font=chunk_font, fill=fill)
-		x += draw.textlength(chunk, font=chunk_font)
+		if chunk_font is None:
+			height = _emoji_height(font, alone)
+			for char in chunk:
+				image = _emoji_image(char, height)
+				if image is None:
+					continue
+				draw._image.paste(image, (round(x), round(baseline - height)), image)
+				x += image.width + 2
+		else:
+			draw.text((x, y), chunk, font=chunk_font, fill=fill)
+			x += draw.textlength(chunk, font=chunk_font)
 
 def _wrap(label: str, font: ImageFont.FreeTypeFont, draw: ImageDraw.ImageDraw, max_width: float) -> list[str]:
 	"""Breaks a label into lines that fit the width. Never splits a word."""
