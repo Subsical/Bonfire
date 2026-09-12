@@ -37,7 +37,7 @@ def write_last_sync_hash(value: str):
 		f.write(value)
 
 def filter_guild_id(interaction: discord.Interaction) -> int | None:
-	"""Which guild's polls this interaction should be scoped to. (None means all guilds, for dev testing)"""
+	"""Which guild this interaction should be scoped to. (None means all guilds)"""
 	if interaction.guild_id == DEV_GUILD.id:
 		return None
 	return interaction.guild_id
@@ -491,10 +491,10 @@ async def wheel_command(interaction: discord.Interaction, options: str, nogif: b
 	await interaction.response.defer()
 
 	try:
-		gif, still, winner, error = await wheel.spin(choices, media.upload_limit(interaction))
+		gif, still, _, error = await wheel.spin(choices, media.upload_limit(interaction))
 	except Exception:
 		traceback.print_exc()
-		gif, still, winner, error = None, None, 0, "Something went wrong while spinning the wheel."
+		gif, still, _, error = None, None, 0, "Something went wrong while spinning the wheel."
 
 	if gif is None:
 		await interaction.followup.send(error, ephemeral=True)

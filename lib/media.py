@@ -37,9 +37,7 @@ def slot():
 ########## ======================================================================== ##########
 
 async def run(*args: str, timeout: float = 300) -> tuple[int, bytes, bytes]:
-	proc = await asyncio.create_subprocess_exec(
-		*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-	)
+	proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 	try:
 		out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
 	except asyncio.TimeoutError:
@@ -241,10 +239,8 @@ async def still_gif(src: str, dst: str, width: int | None, target_bytes: int) ->
 	return await read_if_fits(dst, target_bytes)
 
 async def gifski_encode(frames, dst: str, fps: float, quality: int, loop_forever: bool, target_bytes: int) -> tuple[bytes | None, int]:
-	"""Returns (gif if it fits, size it came out at). The size drives the next guess.
-	Takes either a list of PNG paths or a single .y4m file."""
+	"""Returns (gif, size). The size drives the next guess. Takes either a list of PNG paths or a single .y4m file."""
 	args = ["gifski", "--fps", f"{max(fps, 1):.3f}", "--quality", str(quality)]
-	# -1 writes no loop block at all, which is what plays exactly once (a count of N would play N+1 times)
 	args += ["--repeat", "0" if loop_forever else "-1"]
 	args += ["-o", dst] + ([frames] if isinstance(frames, str) else list(frames))
 	code, _, _ = await run(*args)
@@ -275,7 +271,7 @@ async def _convert(data: bytes, suffix: str, target_bytes: int, fps: float | Non
 
 		info = await probe(src)
 		if not info:
-			return None, "I couldn't read that file, it's either corrupt or not an image/video."
+			return None, "Couldn't read that file, it's either corrupt or not an image/video."
 
 		source_duration = probe_duration(info)
 		animated = is_animated(info)
@@ -305,7 +301,7 @@ async def _convert(data: bytes, suffix: str, target_bytes: int, fps: float | Non
 				out = await still_gif(src, os.path.join(tmp, f"still_{step_width}.gif"), step_width, target_bytes)
 				if out:
 					return out, None
-			return None, "I couldn't get the GIF small enough to upload. Try a lower width."
+			return None, "Couldn't get the GIF small enough to upload. Try a lower width."
 
 		decoded = False
 		step_width, step_fps, step_quality = requested_width, fps, quality
@@ -347,5 +343,5 @@ async def _convert(data: bytes, suffix: str, target_bytes: int, fps: float | Non
 			step_width, step_quality, step_fps = next_width, next_quality, next_fps
 
 	if not decoded:
-		return None, "I couldn't decode that file, it may be corrupt or in a format ffmpeg doesn't support."
-	return None, "I couldn't get the GIF small enough to upload. Try a shorter clip, a lower width, or a lower quality."
+		return None, "Couldn't decode that file, it may be corrupt or in a format ffmpeg doesn't support."
+	return None, "Couldn't get the GIF small enough to upload. Try a shorter clip, a lower width, or a lower quality."

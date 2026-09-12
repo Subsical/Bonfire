@@ -400,7 +400,7 @@ async def _build(options: list[str], winner: int, target_bytes: int) -> tuple[by
 				break
 			quality = max(quality - 20, 40)
 
-		return None, None, "I couldn't get the wheel small enough to upload."
+		return None, None, "Couldn't get the wheel small enough to upload."
 
 def _write_y4m(out, frames, fps: int):
 	"""Writes frames to a stream as raw YUV video, which gifski reads directly.

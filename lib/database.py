@@ -52,7 +52,7 @@ conn.commit()
 ########## ======================================================================== ##########
 
 def hash_voter(user_id: int, poll_id: int) -> str:
-	"""One-way hash of (user, poll) so a voter/creator can't be traced back, but a repeat vote or the poll's own creator can still be recognized."""
+	"""One-way hash of (user, poll) so a voter/creator can't be traced back for full anonymity"""
 	salt = os.environ['BONFIRE_HASH_SALT']
 	raw = f"{user_id}:{poll_id}:{salt}".encode()
 	return hashlib.sha256(raw).hexdigest()
@@ -62,10 +62,7 @@ def hash_voter(user_id: int, poll_id: int) -> str:
 def create_poll(channel_id: int, creator_id: int, question: str, options: list[str], expires_at: str, supports_replies: bool = True, guild_id: int | None = None) -> int:
 	"""Inserts a new poll and returns its poll_id. message_id starts NULL, not 0, so a failed poll
 	can't block a later one via the UNIQUE constraint."""
-	cur.execute(
-		"INSERT INTO Polls (message_id, channel_id, guild_id, question, options, creator_hash, expires_at, supports_replies) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		(None, channel_id, guild_id, question, "\x1f".join(options), "", expires_at, int(supports_replies))
-	)
+	cur.execute("INSERT INTO Polls (message_id, channel_id, guild_id, question, options, creator_hash, expires_at, supports_replies) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (None, channel_id, guild_id, question, "\x1f".join(options), "", expires_at, int(supports_replies)))
 	poll_id = cur.lastrowid
 	cur.execute("UPDATE Polls SET creator_hash = ? WHERE poll_id = ?", (hash_voter(creator_id, poll_id), poll_id))
 	conn.commit()
@@ -157,10 +154,7 @@ def set_thread_id(poll_id: int, thread_id: int):
 	conn.commit()
 
 def add_reply(poll_id: int, reply_text: str, replied_at: str):
-	cur.execute(
-		"UPDATE Polls SET reply_count = reply_count + 1, last_reply = ?, last_reply_at = ? WHERE poll_id = ?",
-		(reply_text, replied_at, poll_id)
-	)
+	cur.execute("UPDATE Polls SET reply_count = reply_count + 1, last_reply = ?, last_reply_at = ? WHERE poll_id = ?", (reply_text, replied_at, poll_id))
 	conn.commit()
 
 def delete_poll(poll_id: int):
