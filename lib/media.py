@@ -30,6 +30,10 @@ def busy() -> bool:
 def queue_full() -> bool:
 	return _queued >= MAX_QUEUED
 
+def slot():
+	"""Hold this while encoding, so every converter shares the same concurrency limit."""
+	return _slots
+
 ########## ======================================================================== ##########
 
 async def run(*args: str, timeout: float = 300) -> tuple[int, bytes, bytes]:
@@ -236,12 +240,13 @@ async def still_gif(src: str, dst: str, width: int | None, target_bytes: int) ->
 		return None
 	return await read_if_fits(dst, target_bytes)
 
-async def gifski_encode(frames: list[str], dst: str, fps: float, quality: int, loop_forever: bool, target_bytes: int) -> tuple[bytes | None, int]:
-	"""Returns (gif if it fits, size it came out at). The size drives the next guess."""
+async def gifski_encode(frames, dst: str, fps: float, quality: int, loop_forever: bool, target_bytes: int) -> tuple[bytes | None, int]:
+	"""Returns (gif if it fits, size it came out at). The size drives the next guess.
+	Takes either a list of PNG paths or a single .y4m file."""
 	args = ["gifski", "--fps", f"{max(fps, 1):.3f}", "--quality", str(quality)]
+	# -1 writes no loop block at all, which is what plays exactly once (a count of N would play N+1 times)
 	args += ["--repeat", "0" if loop_forever else "-1"]
-	args += ["-o", dst, *frames]
-
+	args += ["-o", dst] + ([frames] if isinstance(frames, str) else list(frames))
 	code, _, _ = await run(*args)
 	if code != 0 or not os.path.exists(dst):
 		return None, 0

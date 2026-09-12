@@ -4,11 +4,7 @@ from datetime import datetime, timezone
 import discord
 
 from lib import database as db
-
-COLOR_MAIN = discord.Color(0xFFA733)
-COLOR_MAIN_DARK = discord.Color(0xFF9811)
-COLOR_ALT = discord.Color(0xFFDA44)
-COLOR_ALT_DARK = discord.Color(0xFFD422)
+from lib import theme
 
 DURATIONS = [
 	("1 hour", 60 * 60),
@@ -238,7 +234,7 @@ class PollView(discord.ui.LayoutView):
 		question, expires_at, supports_replies = db.get_poll_render_data(poll_id)
 
 		heading = "###" if len(question) > 30 else "##"
-		container = discord.ui.Container(accent_color=COLOR_MAIN_DARK if closed else COLOR_MAIN)
+		container = discord.ui.Container(accent_color=theme.COLOR_MAIN_DARK if closed else theme.COLOR_MAIN)
 		container.add_item(discord.ui.TextDisplay(f"{heading} {question}"))
 		container.add_item(discord.ui.Separator())
 		container.add_item(discord.ui.TextDisplay(option_lines(poll_id, options)))

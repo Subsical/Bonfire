@@ -1,2 +1,4 @@
 discord.py>=2.6
 sqlcipher3-binary
+Pillow>=10.0
+numpy>=1.24

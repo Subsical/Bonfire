@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import traceback
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -12,7 +13,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from lib import database as db
-from lib import media, polls, userinfo
+from lib import media, polls, theme, userinfo, wheel
 
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all(), help_command=None)
 
@@ -139,9 +140,7 @@ async def poll(
 	"""
 	options = [o for o in (option1, option2, option3, option4, option5) if o]
 	assert len(options) <= 5, "Polls can have at most 5 options."
-	# user-installed /poll can't post a channel message in a guild the bot itself isn't in
-	assert interaction.guild_id is None or bot.get_guild(interaction.guild_id) is not None, \
-		"Bonfire needs to be added to this server for /poll to work here."
+	assert interaction.guild_id is None or bot.get_guild(interaction.guild_id) is not None, "Bonfire needs to be added to this server for /poll to work here."
 
 	target_channel = interaction.channel
 	supports_replies = isinstance(target_channel, discord.abc.GuildChannel)
@@ -382,7 +381,7 @@ async def togif(
 	name = f"{base[:60] or 'converted'}.gif"
 
 	view = discord.ui.LayoutView(timeout=None)
-	container = discord.ui.Container(accent_color=polls.COLOR_MAIN)
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
 	container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{name}", spoiler=spoiler)))
 	container.add_item(discord.ui.TextDisplay(f"-# {len(gif) / (1024 * 1024):.2f}MB • {name}"))
 	view.add_item(container)
@@ -411,7 +410,7 @@ async def userinfo_command(interaction: discord.Interaction, user: discord.User 
 	if boost:
 		badges.append(boost)
 
-	container = discord.ui.Container(accent_color=target.accent_color or polls.COLOR_MAIN)
+	container = discord.ui.Container(accent_color=target.accent_color or theme.COLOR_MAIN)
 
 	title = target.display_name if target.display_name == target.name else f"{target.display_name} ({target.name})"
 	header = [discord.ui.TextDisplay(f"## [{title}](https://discord.com/users/{target.id})\n{target.mention}")]
@@ -465,6 +464,62 @@ async def userinfo_command(interaction: discord.Interaction, user: discord.User 
 	view = discord.ui.LayoutView(timeout=None)
 	view.add_item(container)
 	await interaction.followup.send(view=view, allowed_mentions=discord.abc.AllowedMentions.none())
+
+########## ======================================================================== ##########
+
+@bot.tree.command(name="wheel")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def wheel_command(interaction: discord.Interaction, options: str, nogif: bool = False):
+	"""Spin a wheel to pick one of your options at random.
+
+	:param options: The options to choose between, separated by commas
+	:param nogif: Just pick a winner instantly, without the animation
+	"""
+	choices = wheel.parse_options(options)
+	assert len(choices) >= 2, "Please provide at least two options, separated by commas."
+	assert len(choices) <= wheel.MAX_OPTIONS, f"Wheels can have at most {wheel.MAX_OPTIONS} options."
+	assert all(len(c) <= wheel.MAX_OPTION_LENGTH for c in choices), f"Please keep each option under {wheel.MAX_OPTION_LENGTH} characters."
+
+	if nogif:
+		await interaction.response.send_message(f"🎡 **{random.choice(choices)}**", allowed_mentions=discord.AllowedMentions.none())
+		return
+
+	assert not media.queue_full(), "Drawing too many wheels right now, please try again in a minute."
+
+	await interaction.response.defer()
+
+	try:
+		gif, still, winner, error = await wheel.spin(choices, media.upload_limit(interaction))
+	except Exception:
+		traceback.print_exc()
+		gif, still, winner, error = None, None, 0, "Something went wrong while spinning the wheel."
+
+	if gif is None:
+		await interaction.followup.send(error, ephemeral=True)
+		return
+
+	spinning = discord.ui.LayoutView(timeout=None)
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem("attachment://wheel.gif")))
+	container.add_item(discord.ui.TextDisplay("-# Spinning..."))
+	spinning.add_item(container)
+
+	await interaction.followup.send(view=spinning, file=discord.File(io.BytesIO(gif), filename="wheel.gif"))
+	await asyncio.sleep(wheel.total_seconds()+2)
+
+	result = discord.ui.LayoutView(timeout=None)
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem("attachment://result.png")))
+	result.add_item(container)
+
+	try:
+		await interaction.edit_original_response(
+			view=result, attachments=[discord.File(io.BytesIO(still), filename="result.png")],
+			allowed_mentions=discord.AllowedMentions.none())
+	except (discord.NotFound, discord.Forbidden):
+		pass
 
 ########## ======================================================================== ##########
 
