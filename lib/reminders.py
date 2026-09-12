@@ -56,7 +56,7 @@ def parse_pre_offsets(text: str | None) -> list[int]:
 		return []
 	offsets = {parse_duration(part) for part in text.split(",") if part.strip()}
 	if len(offsets) > MAX_PRE_REMINDERS:
-		raise ValueError(f"That's too many pre-reminders, {MAX_PRE_REMINDERS} is the most I'll take.")
+		raise ValueError(f"That's too many pre-reminders, you can only have {MAX_PRE_REMINDERS} at most.")
 	return sorted(offsets, reverse=True)
 
 def format_duration(seconds: int) -> str:
@@ -108,14 +108,14 @@ async def deliver(bot: discord.Client, reminder: tuple, pre_offset: int | None =
 
 	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
 	heading = "### ⏰ Coming up" if pre_offset is not None else "### 🔔 Reminder"
-	container.add_item(discord.ui.TextDisplay(f"{heading}\n{message}"))
+	container.add_item(discord.ui.TextDisplay(f"{heading}\n<@{user_id}>\n{message}"))
 
 	footer = [f"<t:{int(datetime.fromisoformat(remind_at).timestamp())}:R>"]
 	if pre_offset is not None:
 		footer.append(f"{format_duration(pre_offset)} early")
 	if repeat != "none":
 		footer.append(f"repeats {repeat}")
-	container.add_item(discord.ui.TextDisplay(f"-# {' • '.join(footer)}"))
+	container.add_item(discord.ui.TextDisplay(f"-# {' • '.join(footer)}"))
 
 	view = discord.ui.LayoutView(timeout=None)
 	view.add_item(container)
@@ -129,7 +129,7 @@ async def deliver(bot: discord.Client, reminder: tuple, pre_offset: int | None =
 
 	if channel is not None:
 		try:
-			await channel.send(content=f"<@{user_id}>", view=view, allowed_mentions=discord.AllowedMentions(users=True))
+			await channel.send(view=view, allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[discord.Object(id=user_id)]))
 			return True
 		except (discord.Forbidden, discord.HTTPException):
 			pass

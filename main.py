@@ -586,11 +586,9 @@ async def reminder_add(
 	assert count < reminders.MAX_PER_USER, f"You already have {reminders.MAX_PER_USER} reminders, delete one first."
 
 	repeat_value = repeat.value if repeat else "none"
-	reminder_id = db.create_reminder(
-		interaction.user.id, target.id, interaction.guild_id,
-		message, remind_at.isoformat(), repeat_value, pre_offsets)
+	_ = db.create_reminder(interaction.user.id, target.id, interaction.guild_id, message, remind_at.isoformat(), repeat_value, pre_offsets)
 
-	lines = [f"### {theme.SUC} Reminder #{reminder_id}", message,
+	lines = [f"### {theme.SUC} Reminder", message,
 		f"\n**When:** <t:{int(remind_at.timestamp())}:F> (<t:{int(remind_at.timestamp())}:R>)"]
 	if channel is not None:
 		lines.append(f"**Where:** {target.mention}")
@@ -631,13 +629,13 @@ async def reminder_list(interaction: discord.Interaction):
 
 @reminder_group.command(name="delete")
 async def reminder_delete(interaction: discord.Interaction, reminder_id: int):
-	"""Cancel one of your reminders.
+	"""Delete one of your reminders.
 
 	:param reminder_id: See /reminder list to find the ID
 	"""
 	assert db.get_reminder(reminder_id, interaction.user.id) is not None, "You don't have a reminder with that ID."
 	db.delete_reminder(reminder_id)
-	await interaction.response.send_message(f"{theme.SUC} Reminder #{reminder_id} cancelled.", ephemeral=True)
+	await interaction.response.send_message(f"{theme.SUC} Reminder #{reminder_id} deleted.", ephemeral=True)
 
 ####### =================================================================== #######
 

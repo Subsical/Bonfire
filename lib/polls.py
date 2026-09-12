@@ -72,10 +72,10 @@ def status_line(poll_id: int, expires_at: str, closed: bool) -> str:
 	total = db.total_votes(poll_id)
 	status = f"{total} vote{'s' if total != 1 else ''}"
 	if closed:
-		status += " • Closed"
+		status += " • Closed"
 	else:
 		expires_dt = datetime.fromisoformat(expires_at)
-		status += f" • Closes {discord.utils.format_dt(expires_dt, style='R')}"
+		status += f" • Closes {discord.utils.format_dt(expires_dt, style='R')}"
 	return status
 
 ####### =================================================================== #######
@@ -241,7 +241,7 @@ class PollView(discord.ui.LayoutView):
 		container.add_item(discord.ui.Separator())
 		container.add_item(discord.ui.TextDisplay(option_lines(poll_id, options)))
 		container.add_item(discord.ui.Separator())
-		container.add_item(discord.ui.TextDisplay(f"-# {status_line(poll_id, expires_at, closed)} • Votes are anonymous."))
+		container.add_item(discord.ui.TextDisplay(f"-# {status_line(poll_id, expires_at, closed)} • Votes are anonymous."))
 
 		vote_row = discord.ui.ActionRow()
 		for i, option in enumerate(options):
