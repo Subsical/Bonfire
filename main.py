@@ -12,8 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from lib import database as db
-from lib import media, polls, theme, userinfo, wheel
+from lib import *
 
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all(), help_command=None)
 
@@ -45,7 +44,7 @@ def filter_guild_id(interaction: discord.Interaction) -> int | None:
 def jump_url(guild_id: int | None, channel_id: int, message_id: int) -> str:
 	return f"https://discord.com/channels/{guild_id or '@me'}/{channel_id}/{message_id}"
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 @bot.event
 async def on_ready():
@@ -68,13 +67,14 @@ async def on_ready():
 		bot.add_view(polls.PollView(poll_id, options_raw.split("\x1f"), closed=bool(closed)))
 
 	check_expired_polls.start()
+	check_reminders.start()
 	print("---OUTPUT----------\nBonfire is here.")
 
 @bot.event
 async def on_resumed():
 	print("// resumed session")
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
@@ -92,9 +92,9 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 	if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
 		pass
 	elif type(error) in error_messages:
-		await ctx.send(error_messages[type(error)], delete_after=5)
+		await ctx.send(f"{theme.ERR} {error_messages[type(error)]}", delete_after=8)
 	elif hasattr(error, "original") and type(error.original) in error_messages:
-		await ctx.send(error_messages[type(error.original)], delete_after=5)
+		await ctx.send(f"{theme.ERR} {error_messages[type(error.original)]}", delete_after=8)
 	else:
 		raise error
 
@@ -102,20 +102,20 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
 	# cooldowns are raised before the command runs, so there's no .original on them
 	if isinstance(error, app_commands.CommandOnCooldown):
-		await interaction.response.send_message(f"Slow down! Try again in {error.retry_after:.1f}s.", ephemeral=True)
+		await interaction.response.send_message(f"{theme.ERR} Slow down! Try again in {error.retry_after:.1f}s.", ephemeral=True)
 	elif isinstance(getattr(error, "original", None), AssertionError):
-		await interaction.response.send_message(str(error.original), ephemeral=True)
+		await interaction.response.send_message(f"{theme.ERR} {error.original}", ephemeral=True)
 	else:
 		raise error
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 @tasks.loop(minutes=1)
 async def check_expired_polls():
 	for poll_id in db.expired_poll_ids():
 		await polls.close_poll(bot, poll_id)
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 @bot.tree.command(name="poll")
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -158,7 +158,7 @@ async def poll(
 
 	db.set_message_id(poll_id, poll_message.id)
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 class PollsGroup(app_commands.Group):
 	async def interaction_check(self, interaction: discord.Interaction) -> bool:
 		if not isinstance(interaction.user, discord.Member) or interaction.guild is None:
@@ -249,10 +249,14 @@ async def polls_edit(interaction: discord.Interaction, poll_id: int, question: s
 		await polls.rename_reply_thread(bot, poll_id)
 
 	options = options_raw.split("\x1f")
-	new_options = [option1, option2, option3, option4, option5]
-	for i, new_option in enumerate(new_options):
-		if new_option is not None and i < len(options):
+	for i, new_option in enumerate([option1, option2, option3, option4, option5]):
+		if new_option is None:
+			continue
+		assert i <= len(options), f"Poll #{poll_id} only has {len(options)} options, so option{i + 1} would leave a gap."
+		if i < len(options):
 			options[i] = new_option
+		else:
+			options.append(new_option)
 	if options != options_raw.split("\x1f"):
 		db.set_options(poll_id, options)
 
@@ -261,7 +265,7 @@ async def polls_edit(interaction: discord.Interaction, poll_id: int, question: s
 		db.set_expires_at(poll_id, new_expires_at)
 
 	await polls.refresh_poll_message(bot, poll_id)
-	await interaction.response.send_message(f"Poll #{poll_id} updated.", ephemeral=True)
+	await interaction.response.send_message(f"{theme.SUC} Poll #{poll_id} updated.", ephemeral=True)
 
 @polls_group.command(name="close")
 @app_commands.autocomplete(poll_id=poll_id_autocomplete)
@@ -272,7 +276,7 @@ async def polls_close(interaction: discord.Interaction, poll_id: int):
 	"""
 	assert db.get_poll(poll_id, filter_guild_id(interaction)) is not None, "That poll doesn't exist in this server."
 	await polls.close_poll(bot, poll_id)
-	await interaction.response.send_message(f"Poll #{poll_id} closed.", ephemeral=True)
+	await interaction.response.send_message(f"{theme.SUC} Poll #{poll_id} closed.", ephemeral=True)
 
 @polls_group.command(name="reopen")
 @app_commands.autocomplete(poll_id=poll_id_autocomplete)
@@ -288,9 +292,9 @@ async def polls_reopen(interaction: discord.Interaction, poll_id: int, duration:
 	db.set_expires_at(poll_id, new_expires_at)
 	db.set_closed(poll_id, False)
 	await polls.refresh_poll_message(bot, poll_id)
-	await interaction.response.send_message(f"Poll #{poll_id} reopened.", ephemeral=True)
+	await interaction.response.send_message(f"{theme.SUC} Poll #{poll_id} reopened.", ephemeral=True)
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 @bot.tree.command(name="deletepoll", guild=DEV_GUILD)
 @app_commands.autocomplete(poll_id=poll_id_autocomplete)
@@ -302,9 +306,9 @@ async def deletepoll(interaction: discord.Interaction, poll_id: int):
 	assert await bot.is_owner(interaction.user), "Only the bot owner can use this."
 	assert db.get_poll(poll_id, None) is not None, f"No poll with ID {poll_id}."
 	db.delete_poll(poll_id)
-	await interaction.response.send_message(f"Poll #{poll_id} deleted.", ephemeral=True)
+	await interaction.response.send_message(f"{theme.SUC} Poll #{poll_id} deleted.", ephemeral=True)
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 @bot.tree.command(name="togif")
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -357,7 +361,7 @@ async def togif(
 	else:
 		data, suffix, error = await media.download(link, media.MAX_SOURCE_BYTES)
 		if data is None:
-			await interaction.followup.send(error, ephemeral=True)
+			await interaction.followup.send(f"{theme.ERR} {error}", ephemeral=True)
 			return
 		source_name = os.path.basename(urlparse(link).path) or "converted"
 
@@ -373,7 +377,7 @@ async def togif(
 		gif, error = None, "Something went wrong while converting that file."
 
 	if gif is None:
-		await interaction.followup.send(error, ephemeral=True)
+		await interaction.followup.send(f"{theme.ERR} {error}", ephemeral=True)
 		return
 
 	# sanitizing file name as plain ascii
@@ -388,7 +392,7 @@ async def togif(
 
 	await interaction.followup.send(view=view, file=discord.File(io.BytesIO(gif), filename=name))
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 @bot.tree.command(name="userinfo")
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -465,7 +469,7 @@ async def userinfo_command(interaction: discord.Interaction, user: discord.User 
 	view.add_item(container)
 	await interaction.followup.send(view=view, allowed_mentions=discord.abc.AllowedMentions.none())
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 @bot.tree.command(name="wheel")
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -497,7 +501,7 @@ async def wheel_command(interaction: discord.Interaction, options: str, nogif: b
 		gif, still, _, error = None, None, 0, "Something went wrong while spinning the wheel."
 
 	if gif is None:
-		await interaction.followup.send(error, ephemeral=True)
+		await interaction.followup.send(f"{theme.ERR} {error}", ephemeral=True)
 		return
 
 	spinning = discord.ui.LayoutView(timeout=None)
@@ -521,6 +525,120 @@ async def wheel_command(interaction: discord.Interaction, options: str, nogif: b
 	except (discord.NotFound, discord.Forbidden):
 		pass
 
-########## ======================================================================== ##########
+####### =================================================================== #######
+
+@tasks.loop(seconds=5)
+async def check_reminders():
+	await reminders.check_due(bot)
+
+@check_reminders.before_loop
+async def before_check_reminders():
+	await bot.wait_until_ready()
+
+reminder_group = app_commands.Group(
+	name="reminder", description="Set reminders for yourself",
+	allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+	allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True),
+)
+bot.tree.add_command(reminder_group)
+
+@reminder_group.command(name="add")
+@app_commands.choices(repeat=[app_commands.Choice(name=r, value=r) for r in reminders.REPEATS])
+async def reminder_add(
+	interaction: discord.Interaction, when: str,
+	message: app_commands.Range[str, 1, reminders.MAX_MESSAGE_LENGTH],
+	channel: discord.TextChannel | discord.VoiceChannel | discord.StageChannel | discord.Thread | None = None,
+	repeat: app_commands.Choice[str] | None = None,
+	pre_reminders: str | None = None,
+):
+	"""Set a reminder for yourself.
+
+	:param when: A duration (`10m`, `1h30m`, `1w2d`), a date (`2026-10-16 17:30`), or a timestamp
+	:param message: What to remind you about
+	:param channel: Where to send it (defaults to here or DMs)
+	:param repeat: Whether it should repeat (daily, weekly, monthly, yearly)
+	:param pre_reminders: List of reminders about the upcoming reminder separated by commas, like `1d, 1h`
+	"""
+	target = channel or interaction.channel
+	assert target is not None, "I can't work out where to send this. Try picking a channel."
+
+	if channel is not None:
+		# a public bot can't let someone schedule a message into a channel they can't post in
+		# themselves, so check the asker's permissions rather than just the bot's
+		member = interaction.user if isinstance(interaction.user, discord.Member) else None
+		assert member is not None and channel.guild == interaction.guild, "You can only pick a channel in this server."
+		permissions = channel.permissions_for(member)
+		assert permissions.view_channel and permissions.send_messages, "You don't have permission to post in that channel."
+		assert channel.permissions_for(interaction.guild.me).send_messages, "I can't post in that channel."
+
+	try:
+		remind_at = reminders.parse_when(when)
+		pre_offsets = reminders.parse_pre_offsets(pre_reminders)
+	except ValueError as error:
+		raise AssertionError(str(error)) from None
+
+	now = datetime.now(timezone.utc)
+	assert remind_at > now, "That time has already passed."
+	assert not any(remind_at - timedelta(seconds=o) <= now for o in pre_offsets), \
+		"One of those pre-reminders would already be in the past."
+
+	count = len(db.list_reminders(interaction.user.id))
+	assert count < reminders.MAX_PER_USER, f"You already have {reminders.MAX_PER_USER} reminders, delete one first."
+
+	repeat_value = repeat.value if repeat else "none"
+	reminder_id = db.create_reminder(
+		interaction.user.id, target.id, interaction.guild_id,
+		message, remind_at.isoformat(), repeat_value, pre_offsets)
+
+	lines = [f"### {theme.SUC} Reminder #{reminder_id}", message,
+		f"\n**When:** <t:{int(remind_at.timestamp())}:F> (<t:{int(remind_at.timestamp())}:R>)"]
+	if channel is not None:
+		lines.append(f"**Where:** {target.mention}")
+	if repeat_value != "none":
+		lines.append(f"**Repeats:** {repeat_value}")
+	if pre_offsets:
+		lines.append(f"**Early nudges:** {', '.join(reminders.format_duration(o) for o in pre_offsets)}")
+
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	await interaction.response.send_message(view=view, ephemeral=True)
+
+@reminder_group.command(name="list")
+async def reminder_list(interaction: discord.Interaction):
+	"""See the reminders you have coming up."""
+	rows = db.list_reminders(interaction.user.id)
+	assert rows, "You don't have any reminders set."
+
+	lines = []
+	for reminder_id, message, remind_at, repeat, pre_raw, channel_id, guild_id in rows:
+		stamp = int(datetime.fromisoformat(remind_at).timestamp())
+		extras = []
+		if repeat != "none":
+			extras.append(f"repeats {repeat}")
+		if pre_raw:
+			extras.append(", ".join(reminders.format_duration(int(o)) for o in pre_raw.split(",") if o) + " early")
+		suffix = f" -# ({'; '.join(extras)})" if extras else ""
+		lines.append(f"**#{reminder_id}** <t:{stamp}:R> in <#{channel_id}>\n{message[:120]}{suffix}")
+
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	container.add_item(discord.ui.TextDisplay(f"### ⏰ Your reminders ({len(rows)})"))
+	container.add_item(discord.ui.TextDisplay("\n\n".join(lines)[:3900]))
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	await interaction.response.send_message(view=view, ephemeral=True)
+
+@reminder_group.command(name="delete")
+async def reminder_delete(interaction: discord.Interaction, reminder_id: int):
+	"""Cancel one of your reminders.
+
+	:param reminder_id: See /reminder list to find the ID
+	"""
+	assert db.get_reminder(reminder_id, interaction.user.id) is not None, "You don't have a reminder with that ID."
+	db.delete_reminder(reminder_id)
+	await interaction.response.send_message(f"{theme.SUC} Reminder #{reminder_id} cancelled.", ephemeral=True)
+
+####### =================================================================== #######
 
 bot.run(os.environ['DISCORD_TOKEN'])

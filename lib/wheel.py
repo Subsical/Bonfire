@@ -49,7 +49,7 @@ PALETTE = [
 	"#968CE1", "#E178AA", "#EB6E64", "#78C8C3",
 ]
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def parse_options(raw: str) -> list[str]:
 	"""Split the user's comma separated list properly."""
@@ -183,7 +183,7 @@ def _plan_labels(options: list[str], draw: ImageDraw.ImageDraw, radius: float, h
 	font = _font(WHEEL["min_font_size"])
 	return font, {o: _wrap(o, font, draw, available) for o in options}
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def _wedge_colors(count: int) -> list[str]:
 	"""Cycles the palette round, nudging the last wedge if it wraps onto the first's colour."""
@@ -337,7 +337,7 @@ def _draw_wheel(options: list[str], rotation: float) -> Image.Image:
 	"""A single frame, for callers that only want one."""
 	return Wheel(options).frame(rotation)
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def _rotation_for(index: int, count: int) -> float:
 	"""Rotation that brings the winning wedge to the pointer, landing anywhere inside it."""
@@ -364,7 +364,7 @@ def _ease_out(t: float) -> float:
 	cubic = t * t * t - 3 * t * t + 3 * t
 	return WHEEL["friction"] * cubic + (1 - WHEEL["friction"]) * (1 - (1 - t) ** WHEEL["tail_power"])
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def total_seconds() -> float:
 	"""When the result is fully on screen, so the caller knows when to swap in the still."""

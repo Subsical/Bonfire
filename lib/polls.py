@@ -35,7 +35,7 @@ BAR_EMPTY = {
 CHARS_PER_SQUARE = 2.6
 LINE_WIDTH = round(BAR_LENGTH * CHARS_PER_SQUARE)
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def render_bar(share: float) -> str:
 	"""Renders BAR_LENGTH segments, using capped emoji at each end."""
@@ -78,22 +78,24 @@ def status_line(poll_id: int, expires_at: str, closed: bool) -> str:
 		status += f" • Closes {discord.utils.format_dt(expires_dt, style='R')}"
 	return status
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
-async def get_channel_or_fetch(bot: discord.Client, channel_id: int):
-	"""bot.get_channel is cache-only so fall back to an actual API call if it isn't found"""
+async def get_channel(bot: discord.Client, channel_id: int, guild_id: int | None = None):
+	"""Try to get a channel from the cache or fetch it from the API."""
 	channel = bot.get_channel(channel_id)
 	if channel is not None:
 		return channel
+
+	if guild_id is not None and bot.get_guild(guild_id) is None:
+		return None
 	try:
 		return await bot.fetch_channel(channel_id)
 	except (discord.NotFound, discord.Forbidden):
 		return None
 
 async def close_poll(bot: discord.Client, poll_id: int, interaction: discord.Interaction | None = None):
-	"""Marks a poll closed and redraws its message with buttons disabled.
-	Tries editing through interaction first, falls back to a channel fetch + edit otherwise."""
-	channel_id, message_id, already_closed = db.get_poll_message_ref(poll_id)
+	"""Marks a poll closed and redraws its message with buttons disabled."""
+	channel_id, message_id, already_closed, guild_id = db.get_poll_message_ref(poll_id)
 	if not already_closed:
 		db.set_closed(poll_id, True)
 	view = PollView(poll_id, db.get_poll_options(poll_id), closed=True)
@@ -104,7 +106,7 @@ async def close_poll(bot: discord.Client, poll_id: int, interaction: discord.Int
 	if already_closed:
 		return
 
-	channel = await get_channel_or_fetch(bot, channel_id)
+	channel = await get_channel(bot, channel_id, guild_id)
 	if channel is None:
 		return
 	try:
@@ -121,8 +123,8 @@ async def refresh_poll_message(bot: discord.Client, poll_id: int):
 	ref = db.get_poll_message_ref(poll_id)
 	if ref is None:
 		return
-	channel_id, message_id, closed = ref
-	channel = await get_channel_or_fetch(bot, channel_id)
+	channel_id, message_id, closed, guild_id = ref
+	channel = await get_channel(bot, channel_id, guild_id)
 	if channel is None:
 		return
 	try:
@@ -136,7 +138,7 @@ async def rename_reply_thread(bot: discord.Client, poll_id: int):
 	_, thread_id, question = db.get_poll_reply_thread(poll_id)
 	if thread_id is None:
 		return
-	thread = await get_channel_or_fetch(bot, thread_id)
+	thread = await get_channel(bot, thread_id)
 	if thread is None:
 		return
 	try:
@@ -144,7 +146,7 @@ async def rename_reply_thread(bot: discord.Client, poll_id: int):
 	except discord.HTTPException:
 		pass
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 class VoteButton(discord.ui.Button):
 	def __init__(self, poll_id: int, option_index: int, label: str):
@@ -180,9 +182,9 @@ class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
 
 		channel_id, thread_id, question = db.get_poll_reply_thread(self.poll_id)
 
-		thread = await get_channel_or_fetch(interaction.client, thread_id) if thread_id else None
+		thread = await get_channel(interaction.client, thread_id) if thread_id else None
 		if thread is None:
-			channel = await get_channel_or_fetch(interaction.client, channel_id)
+			channel = await get_channel(interaction.client, channel_id)
 			# standalone thread, not directly attached to the poll message (it looks ugly otherwise)
 			thread = await channel.create_thread(name=f"Replies: {question}"[:100], type=discord.ChannelType.public_thread)
 			db.set_thread_id(self.poll_id, thread.id)

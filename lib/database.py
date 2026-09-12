@@ -34,6 +34,20 @@ cur.execute("""
 		PRIMARY KEY (poll_id, voter_hash)
 	)
 """)
+cur.execute("""
+	CREATE TABLE IF NOT EXISTS Reminders (
+		reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		channel_id INTEGER NOT NULL,
+		guild_id INTEGER,
+		message TEXT NOT NULL,
+		remind_at TEXT NOT NULL,
+		repeat TEXT NOT NULL DEFAULT 'none',
+		pre_offsets TEXT NOT NULL DEFAULT '',
+		sent_offsets TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL
+	)
+""")
 conn.commit()
 
 cur.execute("PRAGMA table_info(Polls)")
@@ -49,7 +63,7 @@ for column, definition in [
 		cur.execute(f"ALTER TABLE Polls ADD COLUMN {column} {definition}")
 conn.commit()
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def hash_voter(user_id: int, poll_id: int) -> str:
 	"""One-way hash of (user, poll) so a voter/creator can't be traced back for full anonymity"""
@@ -57,7 +71,7 @@ def hash_voter(user_id: int, poll_id: int) -> str:
 	raw = f"{user_id}:{poll_id}:{salt}".encode()
 	return hashlib.sha256(raw).hexdigest()
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def create_poll(channel_id: int, creator_id: int, question: str, options: list[str], expires_at: str, supports_replies: bool = True, guild_id: int | None = None) -> int:
 	"""Inserts a new poll and returns its poll_id. message_id starts NULL, not 0, so a failed poll
@@ -96,8 +110,8 @@ def get_poll_render_data(poll_id: int):
 	return cur.fetchone()
 
 def get_poll_message_ref(poll_id: int):
-	"""Gets (channel_id, message_id, closed) for redrawing a poll's live Discord message"""
-	cur.execute("SELECT channel_id, message_id, closed FROM Polls WHERE poll_id = ?", (poll_id,))
+	"""Gets (channel_id, message_id, closed, guild_id) for redrawing a poll's live Discord message"""
+	cur.execute("SELECT channel_id, message_id, closed, guild_id FROM Polls WHERE poll_id = ?", (poll_id,))
 	return cur.fetchone()
 
 def get_poll_options(poll_id: int) -> list[str]:
@@ -162,7 +176,7 @@ def delete_poll(poll_id: int):
 	cur.execute("DELETE FROM Polls WHERE poll_id = ?", (poll_id,))
 	conn.commit()
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def option_counts(poll_id: int, num_options: int) -> list[int]:
 	cur.execute("SELECT option_index, COUNT(*) FROM Votes WHERE poll_id = ? GROUP BY option_index", (poll_id,))
@@ -180,4 +194,52 @@ def cast_vote(poll_id: int, voter_hash: str, option_index: int):
 		"ON CONFLICT(poll_id, voter_hash) DO UPDATE SET option_index = excluded.option_index",
 		(poll_id, voter_hash, option_index)
 	)
+	conn.commit()
+
+####### =================================================================== #######
+
+def create_reminder(user_id: int, channel_id: int, guild_id: int | None, message: str, remind_at: str, repeat: str, pre_offsets: list[int]) -> int:
+	"""Inserts a reminder and returns its reminder_id."""
+	cur.execute(
+		"INSERT INTO Reminders (user_id, channel_id, guild_id, message, remind_at, repeat, pre_offsets, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		(user_id, channel_id, guild_id, message, remind_at, repeat, ",".join(str(o) for o in pre_offsets), datetime.now(timezone.utc).isoformat())
+	)
+	conn.commit()
+	return cur.lastrowid
+
+def due_reminders() -> list[tuple]:
+	"""Every reminder whose main time has arrived."""
+	now_iso = datetime.now(timezone.utc).isoformat()
+	cur.execute("SELECT reminder_id, user_id, channel_id, guild_id, message, remind_at, repeat, pre_offsets, sent_offsets FROM Reminders WHERE remind_at <= ?", (now_iso,))
+	return cur.fetchall()
+
+def pending_reminders() -> list[tuple]:
+	"""Reminders that haven't fired yet but have pre-reminders still to send."""
+	now_iso = datetime.now(timezone.utc).isoformat()
+	cur.execute("SELECT reminder_id, user_id, channel_id, guild_id, message, remind_at, repeat, pre_offsets, sent_offsets FROM Reminders WHERE remind_at > ? AND pre_offsets != ''", (now_iso,))
+	return cur.fetchall()
+
+def get_reminder(reminder_id: int, user_id: int | None = None):
+	"""Only returns a reminder if it belongs to the given user. user_id=None skips that filter."""
+	if user_id is None:
+		cur.execute("SELECT reminder_id, user_id, channel_id, guild_id, message, remind_at, repeat, pre_offsets, sent_offsets FROM Reminders WHERE reminder_id = ?", (reminder_id,))
+	else:
+		cur.execute("SELECT reminder_id, user_id, channel_id, guild_id, message, remind_at, repeat, pre_offsets, sent_offsets FROM Reminders WHERE reminder_id = ? AND user_id = ?", (reminder_id, user_id))
+	return cur.fetchone()
+
+def list_reminders(user_id: int) -> list[tuple]:
+	cur.execute("SELECT reminder_id, message, remind_at, repeat, pre_offsets, channel_id, guild_id FROM Reminders WHERE user_id = ? ORDER BY remind_at", (user_id,))
+	return cur.fetchall()
+
+def set_remind_at(reminder_id: int, remind_at: str):
+	"""Moves a repeating reminder to its next occurrence, and clears the pre-reminders it already sent."""
+	cur.execute("UPDATE Reminders SET remind_at = ?, sent_offsets = '' WHERE reminder_id = ?", (remind_at, reminder_id))
+	conn.commit()
+
+def set_sent_offsets(reminder_id: int, offsets: list[int]):
+	cur.execute("UPDATE Reminders SET sent_offsets = ? WHERE reminder_id = ?", (",".join(str(o) for o in offsets), reminder_id))
+	conn.commit()
+
+def delete_reminder(reminder_id: int):
+	cur.execute("DELETE FROM Reminders WHERE reminder_id = ?", (reminder_id,))
 	conn.commit()

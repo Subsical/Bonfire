@@ -34,7 +34,7 @@ def slot():
 	"""Hold this while encoding, so every converter shares the same concurrency limit."""
 	return _slots
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 async def run(*args: str, timeout: float = 300) -> tuple[int, bytes, bytes]:
 	proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -68,7 +68,7 @@ def upload_limit(interaction: discord.Interaction) -> int:
 	limit = interaction.guild.filesize_limit if interaction.guild is not None else 10*1024*1024
 	return limit-512 * 1024
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def _is_public_host(host: str) -> bool:
 	"""Resolve a hostname and refuse anything pointing at a private or local address."""
@@ -143,7 +143,7 @@ async def download(url: str, max_bytes: int) -> tuple[bytes | None, str, str | N
 	except asyncio.TimeoutError:
 		return None, "", "That link took too long to download."
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 async def probe(path: str) -> dict:
 	code, out, _ = await run(
@@ -191,7 +191,7 @@ def is_animated(info: dict) -> bool:
 	duration = probe_duration(info)
 	return duration is not None and duration > 0.1
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 def _trim_args(start: float | None, duration: float | None) -> list[str]:
 	args = []
@@ -251,7 +251,7 @@ async def gifski_encode(frames, dst: str, fps: float, quality: int, loop_forever
 		return None, size
 	return await asyncio.to_thread(_read_file, dst) or None, size
 
-########## ======================================================================== ##########
+####### =================================================================== #######
 
 async def to_gif(data: bytes, suffix: str, target_bytes: int, *, fps: float | None = None, width: int | None = None, quality: int = 90, start: float | None = None, duration: float | None = None, reverse: bool = False, loop_forever: bool = True, speed: float = 1.0) -> tuple[bytes | None, str | None]:
 	"""Convert image/video bytes to a GIF under target_bytes. Returns (gif, error).
