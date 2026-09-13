@@ -877,7 +877,7 @@ class BattleshipView(GameView):
 				if player is None:
 					continue
 				setup = self.setups.get(seat)
-				mark = "✅" if setup is not None and setup.done else theme.LOADING
+				mark = theme.SUC_L if setup is not None and setup.done else theme.LOADING
 				waiting.append(f"{mark} {name_of(player)}")
 			container.add_item(discord.ui.TextDisplay(
 				"Both players need to place their fleet.\n" + "  •  ".join(waiting)))
