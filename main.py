@@ -74,6 +74,15 @@ async def on_ready():
 async def on_resumed():
 	print("// resumed session")
 
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+	await games.abandon(payload.message_id)
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+	for message_id in payload.message_ids:
+		await games.abandon(message_id)
+
 ####### =================================================================== #######
 
 @bot.event
@@ -646,16 +655,16 @@ bot.tree.add_command(vs_group)
 
 async def start_game(interaction: discord.Interaction, title: str, build, opponent: discord.User | None):
 	"""Posts a challenge. A named opponent has to accept it; with none, anyone can take it."""
-	assert opponent is None or not opponent.bot, "You can't play against a bot."
-	assert opponent is None or opponent.id != interaction.user.id, "You can't play against yourself."
-	assert not games.busy(interaction.user), "You're already in a game, finish that one first."
-	assert not games.busy(opponent), f"{opponent.display_name} is already in a game." if opponent else ""
+	assert opponent is None or not opponent.bot, "You can't play against a bot!"
+	assert opponent is None or opponent.id != interaction.user.id, "You can't play against yourself!"
+	assert not games.busy(interaction.user), "You're already in a game!."
+	assert not games.busy(opponent), f"{opponent.display_name} is already in a game!" if opponent else ""
 
 	challenge = games.ChallengeView(interaction.user, opponent, title, build)
 	mentions = discord.AllowedMentions.none() if opponent is None else discord.AllowedMentions(
 		everyone=False, roles=False, users=[opponent])
 	await interaction.response.send_message(view=challenge, allowed_mentions=mentions)
-	challenge.message = await interaction.original_response()
+	games.track(challenge, await interaction.original_response())
 
 @vs_group.command(name="rps")
 async def vs_rps(interaction: discord.Interaction, opponent: discord.User | None = None):

@@ -9,6 +9,31 @@ PLAYING: set[int] = set()
 def busy(user: discord.User | None) -> bool:
 	return user is not None and user.id in PLAYING
 
+# live games and challenges by message id, so a deleted message can find what to tear down
+LIVE: dict[int, "GameView | ChallengeView"] = {}
+
+def track(view: "GameView | ChallengeView", message: discord.Message | None):
+	"""Points a view at its message and files it under that message's id."""
+	view.message = message
+	if message is not None:
+		LIVE[message.id] = view
+
+def untrack(view: "GameView | ChallengeView"):
+	if view.message is not None:
+		LIVE.pop(view.message.id, None)
+
+async def abandon(message_id: int):
+	"""Ends whatever game lived on a deleted message, without saying anything."""
+	view = LIVE.pop(message_id, None)
+	if view is None:
+		return
+	view.stop()  # no timeout should fire and try to edit a message that's gone
+	if isinstance(view, GameView):
+		view.finish()
+		await view.cleanup()
+	else:
+		view.settled = True
+
 RPS_CHOICES = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
 RPS_BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
 
@@ -216,6 +241,7 @@ class GameView(discord.ui.LayoutView):
 	def finish(self):
 		"""Marks the game over."""
 		self.finished = True
+		untrack(self)
 		for player in self.players:
 			if player is not None:
 				PLAYING.discard(player.id)
@@ -530,6 +556,7 @@ class ChallengeView(discord.ui.LayoutView):
 
 	async def close(self, footer: str):
 		self.settled = True
+		untrack(self)
 		self.render(footer)
 
 	async def on_timeout(self):
@@ -559,9 +586,10 @@ class AcceptButton(discord.ui.Button):
 			await interaction.response.defer()
 			return
 		challenge.settled = True
+		untrack(challenge)
 		game = challenge.build(interaction.user)
 		await interaction.response.edit_message(view=game, allowed_mentions=game.ping_turn())
-		game.message = await interaction.original_response()
+		track(game, await interaction.original_response())
 
 class CancelButton(discord.ui.Button):
 	def __init__(self):
