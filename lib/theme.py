@@ -1,18 +1,20 @@
 from discord import Color
 
 MAIN = "#FFA733"
-MAIN_DARK = "#875515"
+# MAIN_DARK = "#B37019"
 ALT = "#FFDA44"
-ALT_DARK = "#AF9016"
+# ALT_DARK = "#B39419"
 ERROR = "#FF3333"
-ERROR_DARK = "#871515"
+ERROR_DARK = "#9E1A1A"
+DARK = "#2C2D32"
 
 COLOR_MAIN = Color.from_str(MAIN)
-COLOR_MAIN_DARK = Color.from_str(MAIN_DARK)
+# COLOR_MAIN_DARK = Color.from_str(MAIN_DARK)
 COLOR_ALT = Color.from_str(ALT)
-COLOR_ALT_DARK = Color.from_str(ALT_DARK)
+# COLOR_ALT_DARK = Color.from_str(ALT_DARK)
 COLOR_ERROR = Color.from_str(ERROR)
 COLOR_ERROR_DARK = Color.from_str(ERROR_DARK)
+COLOR_DARK = Color.from_str(DARK)
 
 SUC = "<:suc:1548423950764220608>"
 ERR = "<:err:1548423937237586020>"

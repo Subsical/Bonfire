@@ -150,7 +150,7 @@ async def rename_reply_thread(bot: discord.Client, poll_id: int):
 
 class VoteButton(discord.ui.Button):
 	def __init__(self, poll_id: int, option_index: int, label: str):
-		super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=f"bonfire_vote:{poll_id}:{option_index}")
+		super().__init__(label=label, style=discord.ButtonStyle.gray, custom_id=f"bonfire_vote:{poll_id}:{option_index}")
 		self.poll_id = poll_id
 		self.option_index = option_index
 
@@ -206,7 +206,7 @@ class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
 
 class ReplyButton(discord.ui.Button):
 	def __init__(self, poll_id: int, closed: bool = False):
-		super().__init__(emoji="💬", label="Reply", style=discord.ButtonStyle.primary, custom_id=f"bonfire_reply:{poll_id}", disabled=closed)
+		super().__init__(emoji="💬", label="Reply", style=discord.ButtonStyle.blurple, custom_id=f"bonfire_reply:{poll_id}", disabled=closed)
 		self.poll_id = poll_id
 
 	async def callback(self, interaction: discord.Interaction):
@@ -216,7 +216,7 @@ class EndPollButton(discord.ui.Button):
 	def __init__(self, poll_id: int, closed: bool = False):
 		label = "Poll ended" if closed else "End poll"
 		emoji = None if closed else "🔒"
-		super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.danger, custom_id=f"bonfire_end:{poll_id}", disabled=closed)
+		super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.red, custom_id=f"bonfire_end:{poll_id}", disabled=closed)
 		self.poll_id = poll_id
 
 	async def callback(self, interaction: discord.Interaction):
@@ -236,7 +236,7 @@ class PollView(discord.ui.LayoutView):
 		question, expires_at, supports_replies = db.get_poll_render_data(poll_id)
 
 		heading = "###" if len(question) > 30 else "##"
-		container = discord.ui.Container(accent_color=theme.COLOR_MAIN_DARK if closed else theme.COLOR_MAIN)
+		container = discord.ui.Container(accent_color=theme.COLOR_DARK if closed else theme.COLOR_MAIN)
 		container.add_item(discord.ui.TextDisplay(f"{heading} {question}"))
 		container.add_item(discord.ui.Separator())
 		container.add_item(discord.ui.TextDisplay(option_lines(poll_id, options)))

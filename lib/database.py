@@ -8,60 +8,42 @@ conn = sqlite3.connect('bonfire.db')
 cur = conn.cursor()
 cur.execute(f"PRAGMA key=\"{os.environ['BONFIRE_DB_KEY']}\"")
 
-cur.execute("""
-	CREATE TABLE IF NOT EXISTS Polls (
-		poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
-		message_id INTEGER UNIQUE,
-		channel_id INTEGER NOT NULL,
-		guild_id INTEGER,
-		question TEXT NOT NULL,
-		options TEXT NOT NULL,
-		thread_id INTEGER,
-		creator_hash TEXT NOT NULL,
-		expires_at TEXT NOT NULL,
-		closed INTEGER NOT NULL DEFAULT 0,
-		reply_count INTEGER NOT NULL DEFAULT 0,
-		last_reply TEXT,
-		last_reply_at TEXT,
-		supports_replies INTEGER NOT NULL DEFAULT 1
-	)
-""")
-cur.execute("""
-	CREATE TABLE IF NOT EXISTS Votes (
-		poll_id INTEGER NOT NULL,
-		voter_hash TEXT NOT NULL,
-		option_index INTEGER NOT NULL,
-		PRIMARY KEY (poll_id, voter_hash)
-	)
-""")
-cur.execute("""
-	CREATE TABLE IF NOT EXISTS Reminders (
-		reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
-		user_id INTEGER NOT NULL,
-		channel_id INTEGER NOT NULL,
-		guild_id INTEGER,
-		message TEXT NOT NULL,
-		remind_at TEXT NOT NULL,
-		repeat TEXT NOT NULL DEFAULT 'none',
-		pre_offsets TEXT NOT NULL DEFAULT '',
-		sent_offsets TEXT NOT NULL DEFAULT '',
-		created_at TEXT NOT NULL
-	)
-""")
-conn.commit()
+# CREATE TABLE IF NOT EXISTS Polls (
+#	poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
+#	message_id INTEGER UNIQUE,
+#	channel_id INTEGER NOT NULL,
+#	guild_id INTEGER,
+#	question TEXT NOT NULL,
+#	options TEXT NOT NULL,
+#	thread_id INTEGER,
+#	creator_hash TEXT NOT NULL,
+#	expires_at TEXT NOT NULL,
+#	closed INTEGER NOT NULL DEFAULT 0,
+#	reply_count INTEGER NOT NULL DEFAULT 0,
+#	last_reply TEXT,
+#	last_reply_at TEXT,
+#	supports_replies INTEGER NOT NULL DEFAULT 1
+# )
 
-cur.execute("PRAGMA table_info(Polls)")
-existing_columns = {row[1] for row in cur.fetchall()}
-for column, definition in [
-	("reply_count", "INTEGER NOT NULL DEFAULT 0"),
-	("last_reply", "TEXT"),
-	("last_reply_at", "TEXT"),
-	("supports_replies", "INTEGER NOT NULL DEFAULT 1"),
-	("guild_id", "INTEGER"),
-]:
-	if column not in existing_columns:
-		cur.execute(f"ALTER TABLE Polls ADD COLUMN {column} {definition}")
-conn.commit()
+# CREATE TABLE IF NOT EXISTS Votes (
+#	poll_id INTEGER NOT NULL,
+#	voter_hash TEXT NOT NULL,
+#	option_index INTEGER NOT NULL,
+#	PRIMARY KEY (poll_id, voter_hash)
+# )
+
+# CREATE TABLE IF NOT EXISTS Reminders (
+#	reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+#	user_id INTEGER NOT NULL,
+#	channel_id INTEGER NOT NULL,
+#	guild_id INTEGER,
+#	message TEXT NOT NULL,
+#	remind_at TEXT NOT NULL,
+#	repeat TEXT NOT NULL DEFAULT 'none',
+#	pre_offsets TEXT NOT NULL DEFAULT '',
+#	sent_offsets TEXT NOT NULL DEFAULT '',
+#	created_at TEXT NOT NULL
+# )
 
 ####### =================================================================== #######
 

@@ -639,4 +639,57 @@ async def reminder_delete(interaction: discord.Interaction, reminder_id: int):
 
 ####### =================================================================== #######
 
+vs_group = app_commands.Group(
+	name="vs", description="Play a game against someone",
+	allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+	allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True),
+)
+bot.tree.add_command(vs_group)
+
+async def start_game(interaction: discord.Interaction, title: str, build, opponent: discord.User | None):
+	"""Starts a game, or asks the opponent first if one was named."""
+	assert opponent is None or not opponent.bot, "You can't play against a bot."
+	assert opponent is None or opponent.id != interaction.user.id, "You can't play against yourself."
+	assert not games.busy(interaction.user), "You're already in a game, finish that one first."
+	assert not games.busy(opponent), f"{opponent.display_name} is already in a game." if opponent else ""
+
+	if opponent is None:
+		view = build()
+		await interaction.response.send_message(view=view, allowed_mentions=discord.AllowedMentions.none())
+		view.message = await interaction.original_response()
+		return
+
+	challenge = games.ChallengeView(interaction.user, opponent, title, build)
+	await interaction.response.send_message(view=challenge, allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[opponent]))
+	challenge.message = await interaction.original_response()
+
+@vs_group.command(name="rps")
+async def vs_rps(interaction: discord.Interaction, opponent: discord.User | None = None):
+	"""Play rock paper scissors against someone.
+
+	:param opponent: Play against a specific user
+	"""
+	await start_game(interaction, "✊ Rock Paper Scissors",
+		lambda: games.RPSView(interaction.user, opponent), opponent)
+
+@vs_group.command(name="tictactoe")
+async def vs_tictactoe(interaction: discord.Interaction, opponent: discord.User | None = None):
+	"""Play TicTacToe against someone.
+
+	:param opponent: Play against a specific user
+	"""
+	await start_game(interaction, "⭕ Tic Tac Toe",
+		lambda: games.TicTacToeView(interaction.user, opponent), opponent)
+
+@vs_group.command(name="connectfour")
+async def vs_connectfour(interaction: discord.Interaction, opponent: discord.User | None = None):
+	"""Play Connect Four against someone.
+
+	:param opponent: Play against a specific user
+	"""
+	await start_game(interaction, "🧮 Connect Four",
+		lambda: games.ConnectFourView(interaction.user, opponent), opponent)
+
+####### =================================================================== #######
+
 bot.run(os.environ['DISCORD_TOKEN'])
