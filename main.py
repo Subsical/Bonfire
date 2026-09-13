@@ -185,7 +185,7 @@ async def poll_id_autocomplete(interaction: discord.Interaction, current: str) -
 		return []
 	choices = []
 	for poll_id, question, closed, expires_at, channel_id, message_id, guild_id in db.list_polls(filter_guild_id(interaction)):
-		label = f"#{poll_id} — {question}"
+		label = f"#{poll_id} - {question}"
 		if current.lower() in label.lower():
 			choices.append(app_commands.Choice(name=label[:100], value=poll_id))
 	return choices[:25]
@@ -200,7 +200,7 @@ async def polls_list(interaction: discord.Interaction):
 	lines = []
 	for poll_id, question, closed, expires_at, channel_id, message_id, guild_id in rows:
 		status = "closed" if closed else f"open, closes {discord.utils.format_dt(datetime.fromisoformat(expires_at), style='R')}"
-		lines.append(f"**#{poll_id}** — [{question}]({jump_url(guild_id, channel_id, message_id)}) ({status})")
+		lines.append(f"**#{poll_id}** - [{question}]({jump_url(guild_id, channel_id, message_id)}) ({status})")
 	await interaction.response.send_message("\n".join(lines), suppress_embeds=True, ephemeral=True)
 
 @polls_group.command(name="view")
@@ -563,8 +563,6 @@ async def reminder_add(
 	assert target is not None, "I can't work out where to send this. Try picking a channel."
 
 	if channel is not None:
-		# a public bot can't let someone schedule a message into a channel they can't post in
-		# themselves, so check the asker's permissions rather than just the bot's
 		member = interaction.user if isinstance(interaction.user, discord.Member) else None
 		assert member is not None and channel.guild == interaction.guild, "You can only pick a channel in this server."
 		permissions = channel.permissions_for(member)
@@ -647,20 +645,16 @@ vs_group = app_commands.Group(
 bot.tree.add_command(vs_group)
 
 async def start_game(interaction: discord.Interaction, title: str, build, opponent: discord.User | None):
-	"""Starts a game, or asks the opponent first if one was named."""
+	"""Posts a challenge. A named opponent has to accept it; with none, anyone can take it."""
 	assert opponent is None or not opponent.bot, "You can't play against a bot."
 	assert opponent is None or opponent.id != interaction.user.id, "You can't play against yourself."
 	assert not games.busy(interaction.user), "You're already in a game, finish that one first."
 	assert not games.busy(opponent), f"{opponent.display_name} is already in a game." if opponent else ""
 
-	if opponent is None:
-		view = build()
-		await interaction.response.send_message(view=view, allowed_mentions=discord.AllowedMentions.none())
-		view.message = await interaction.original_response()
-		return
-
 	challenge = games.ChallengeView(interaction.user, opponent, title, build)
-	await interaction.response.send_message(view=challenge, allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[opponent]))
+	mentions = discord.AllowedMentions.none() if opponent is None else discord.AllowedMentions(
+		everyone=False, roles=False, users=[opponent])
+	await interaction.response.send_message(view=challenge, allowed_mentions=mentions)
 	challenge.message = await interaction.original_response()
 
 @vs_group.command(name="rps")
@@ -670,7 +664,7 @@ async def vs_rps(interaction: discord.Interaction, opponent: discord.User | None
 	:param opponent: Play against a specific user
 	"""
 	await start_game(interaction, "✊ Rock Paper Scissors",
-		lambda: games.RPSView(interaction.user, opponent), opponent)
+		lambda accepter: games.RPSView(interaction.user, accepter), opponent)
 
 @vs_group.command(name="tictactoe")
 async def vs_tictactoe(interaction: discord.Interaction, opponent: discord.User | None = None):
@@ -679,7 +673,7 @@ async def vs_tictactoe(interaction: discord.Interaction, opponent: discord.User 
 	:param opponent: Play against a specific user
 	"""
 	await start_game(interaction, "⭕ Tic Tac Toe",
-		lambda: games.TicTacToeView(interaction.user, opponent), opponent)
+		lambda accepter: games.TicTacToeView(interaction.user, accepter), opponent)
 
 @vs_group.command(name="connectfour")
 async def vs_connectfour(interaction: discord.Interaction, opponent: discord.User | None = None):
@@ -688,7 +682,16 @@ async def vs_connectfour(interaction: discord.Interaction, opponent: discord.Use
 	:param opponent: Play against a specific user
 	"""
 	await start_game(interaction, "🧮 Connect Four",
-		lambda: games.ConnectFourView(interaction.user, opponent), opponent)
+		lambda accepter: games.ConnectFourView(interaction.user, accepter), opponent)
+
+@vs_group.command(name="battleship")
+async def vs_battleship(interaction: discord.Interaction, opponent: discord.User | None = None):
+	"""Play Battleship against someone.
+
+	:param opponent: Play against a specific user
+	"""
+	await start_game(interaction, f"{games.BATTLESHIP} Battleship",
+		lambda accepter: games.BattleshipView(interaction.user, accepter), opponent)
 
 ####### =================================================================== #######
 
