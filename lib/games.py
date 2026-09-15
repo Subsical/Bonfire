@@ -22,6 +22,26 @@ def untrack(view: "GameView | ChallengeView"):
 	if view.message is not None:
 		LIVE.pop(view.message.id, None)
 
+async def shutdown():
+	"""Disables the buttons on every live game and challenge."""
+	for view in list(LIVE.values()):
+		view.stop()
+		if isinstance(view, GameView):
+			view.restarted = True
+			view.finish()
+			view.render()
+			view.disable_all()
+		else:
+			await view.close("-# The bot restarted, so this challenge was cancelled.")
+		if view.message is not None:
+			try:
+				await view.message.edit(view=view)
+			except discord.HTTPException as error:
+				print(f"Couldn't close out game message {view.message.id}: {error}")
+		if isinstance(view, GameView):
+			await view.cleanup()
+	LIVE.clear()
+
 async def abandon(message_id: int):
 	"""Ends whatever game lived on a deleted message, without saying anything."""
 	view = LIVE.pop(message_id, None)
@@ -192,6 +212,7 @@ class GameView(discord.ui.LayoutView):
 		self.finished = False
 		self.forfeited_by: int | None = None
 		self.expired = False
+		self.restarted = False
 		self.message: discord.Message | None = None
 		for player in self.players:
 			if player is not None:
@@ -204,7 +225,7 @@ class GameView(discord.ui.LayoutView):
 	@property
 	def won(self) -> bool:
 		"""Ended by someone actually winning, rather than giving up or timing out."""
-		return self.finished and self.forfeited_by is None and not self.expired
+		return self.finished and self.forfeited_by is None and not self.ended_early
 
 	def seat_of(self, user: discord.User) -> int | None:
 		return next((i for i, p in enumerate(self.players) if p is not None and p.id == user.id), None)
@@ -259,14 +280,23 @@ class GameView(discord.ui.LayoutView):
 		if row is not None:
 			container.add_item(row)
 
+	@property
+	def ended_early(self) -> bool:
+		"""Cut short by timeout or bot restart."""
+		return self.expired or self.restarted
+
+	def expired_text(self) -> str:
+		"""Reason why a game expired."""
+		return "Game cancelled because the bot restarted." if self.restarted else "Game expired due to inactivity."
+
 	def ending_text(self) -> str | None:
 		"""The line that replaces the usual status once a game is over."""
-		if self.expired:
-			return "Game expired due to inactivity."
+		if self.ended_early:
+			return self.expired_text()
 		return self.forfeit_text()
 
 	def forfeit_text(self) -> str | None:
-		"""The result line when someone gave up, or None if nobody did."""
+		"""The result line when someone forfeited, or None if nobody did."""
 		if self.forfeited_by is None:
 			return None
 		quitter, _ = self.players[self.forfeited_by], self.players[1 - self.forfeited_by]
@@ -289,8 +319,8 @@ class GameView(discord.ui.LayoutView):
 		if self.message is not None:
 			try:
 				await self.message.edit(view=self)
-			except discord.HTTPException:
-				pass
+			except discord.HTTPException as error:
+				print(f"Couldn't expire game message {self.message.id}: {error}")
 		await self.cleanup()
 
 	async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
@@ -373,8 +403,8 @@ class RPSView(GameView):
 			lines = [f"{name_of(self.players[0])} {RPS_CHOICES[first]}  ×  {RPS_CHOICES[second]} {name_of(self.players[1])}", ""]
 			lines.append("Game over, it's a draw." if winner is None else f"Game over, **{name_of(self.players[winner])}** wins!")
 			container.add_item(discord.ui.TextDisplay("\n".join(lines)))
-		elif self.expired:
-			container.add_item(discord.ui.TextDisplay("Game expired due to inactivity."))
+		elif self.ended_early:
+			container.add_item(discord.ui.TextDisplay(self.expired_text()))
 			waiting = None
 		else:
 			locked = [name_of(p) for p, pick in zip(self.players, self.picks) if pick is not None]
@@ -437,7 +467,7 @@ class TicTacToeView(GameView):
 		elif full:
 			container.add_item(discord.ui.TextDisplay("Game over, it's a draw."))
 		else:
-			container.add_item(discord.ui.TextDisplay("Game expired due to inactivity." if self.expired
+			container.add_item(discord.ui.TextDisplay(self.expired_text() if self.ended_early
 				else f"**{TTT_MARKS[self.turn]}** {name_of(self.players[self.turn])}'s turn."))
 
 		winning = result[1] if result is not None else []
@@ -502,7 +532,7 @@ class ConnectFourView(GameView):
 		elif full:
 			container.add_item(discord.ui.TextDisplay("Game over, it's a draw."))
 		else:
-			container.add_item(discord.ui.TextDisplay("Game expired due to inactivity." if self.expired
+			container.add_item(discord.ui.TextDisplay(self.expired_text() if self.ended_early
 				else f"{C4_DISCS[self.turn]} {name_of(self.players[self.turn])}'s turn."))
 
 		if not self.won:
@@ -867,9 +897,9 @@ class BattleshipView(GameView):
 			if not self.placing:
 				container.add_item(discord.ui.Separator())
 				container.add_item(discord.ui.TextDisplay(self.recap()))
-		elif (gave_up is not None or self.expired) and self.placing:
+		elif (gave_up is not None or self.ended_early) and self.placing:
 			container.add_item(discord.ui.TextDisplay(
-				gave_up if gave_up is not None else "Game expired due to inactivity."))
+				gave_up if gave_up is not None else self.expired_text()))
 		elif self.placing:
 			waiting = []
 			for seat in (0, 1):
@@ -880,12 +910,12 @@ class BattleshipView(GameView):
 				mark = theme.SUC_L if setup is not None and setup.done else theme.LOADING
 				waiting.append(f"{mark} {name_of(player)}")
 			container.add_item(discord.ui.TextDisplay(
-				"Both players need to place their fleet.\n" + "  •  ".join(waiting)))
+				"Both players need to place their fleet.\n" + " • ".join(waiting)))
 		else:
 			note = {"hit": "A hit!", "sunk": "Ship sunk!", "miss": "Missed."}.get(self.last, "")
 			container.add_item(discord.ui.TextDisplay(
 				gave_up if gave_up is not None
-				else "Game expired due to inactivity." if self.expired
+				else self.expired_text() if self.ended_early
 				else f"{note} {name_of(self.players[self.turn])} is firing at {name_of(self.players[1 - self.turn])}.".strip()))
 			target = 1 - self.turn
 			fleet = self.setups[target].fleet

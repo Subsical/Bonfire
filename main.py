@@ -4,6 +4,7 @@ import io
 import json
 import os
 import random
+import signal
 import traceback
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -14,7 +15,14 @@ from discord.ext import commands, tasks
 
 from lib import *
 
-bot = commands.Bot(command_prefix='!', intents=discord.Intents.all(), help_command=None)
+
+class Bonfire(commands.Bot):
+	async def close(self):
+		"""Do cleanup before the bot shuts down."""
+		await games.shutdown()
+		await super().close()
+
+bot = Bonfire(command_prefix='!', intents=discord.Intents.all(), help_command=None)
 
 SYNC_HASH_FILE = "command_sync.hash"
 DEV_GUILD = discord.Object(id=954760200777265162)
@@ -703,5 +711,9 @@ async def vs_battleship(interaction: discord.Interaction, opponent: discord.User
 		lambda accepter: games.BattleshipView(interaction.user, accepter), opponent)
 
 ####### =================================================================== #######
+
+def terminate(signum, frame):
+	raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, terminate)
 
 bot.run(os.environ['DISCORD_TOKEN'])
