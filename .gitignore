@@ -1,6 +1,11 @@
 __pycache__/
 .vscode/
+
+data/
+web/
+
 *.db
 *.pyc
 Dockerfile
 command_sync.hash
+.env

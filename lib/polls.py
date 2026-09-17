@@ -148,11 +148,15 @@ async def rename_reply_thread(bot: discord.Client, poll_id: int):
 
 ####### =================================================================== #######
 
-class VoteButton(discord.ui.Button):
-	def __init__(self, poll_id: int, option_index: int, label: str):
-		super().__init__(label=label, style=discord.ButtonStyle.gray, custom_id=f"bonfire_vote:{poll_id}:{option_index}")
+class VoteButton(discord.ui.DynamicItem[discord.ui.Button], template=r"bonfire_vote:(?P<poll_id>\d+):(?P<option_index>\d+)"):
+	def __init__(self, poll_id: int, option_index: int, label: str = "\u200B", disabled: bool = False):
+		super().__init__(discord.ui.Button(label=label, style=discord.ButtonStyle.gray, custom_id=f"bonfire_vote:{poll_id}:{option_index}", disabled=disabled))
 		self.poll_id = poll_id
 		self.option_index = option_index
+
+	@classmethod
+	async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match):
+		return cls(int(match["poll_id"]), int(match["option_index"]))
 
 	async def callback(self, interaction: discord.Interaction):
 		if db.is_closed(self.poll_id):
@@ -204,20 +208,28 @@ class ReplyModal(discord.ui.Modal, title="Reply anonymously"):
 		else:
 			await interaction.followup.send("Something went wrong, try again.", ephemeral=True)
 
-class ReplyButton(discord.ui.Button):
+class ReplyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"bonfire_reply:(?P<poll_id>\d+)"):
 	def __init__(self, poll_id: int, closed: bool = False):
-		super().__init__(emoji="💬", label="Reply", style=discord.ButtonStyle.blurple, custom_id=f"bonfire_reply:{poll_id}", disabled=closed)
+		super().__init__(discord.ui.Button(emoji="💬", label="Reply", style=discord.ButtonStyle.blurple, custom_id=f"bonfire_reply:{poll_id}", disabled=closed))
 		self.poll_id = poll_id
+
+	@classmethod
+	async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match):
+		return cls(int(match["poll_id"]))
 
 	async def callback(self, interaction: discord.Interaction):
 		await interaction.response.send_modal(ReplyModal(self.poll_id))
 
-class EndPollButton(discord.ui.Button):
+class EndPollButton(discord.ui.DynamicItem[discord.ui.Button], template=r"bonfire_end:(?P<poll_id>\d+)"):
 	def __init__(self, poll_id: int, closed: bool = False):
 		label = "Poll ended" if closed else "End poll"
 		emoji = None if closed else "🔒"
-		super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.red, custom_id=f"bonfire_end:{poll_id}", disabled=closed)
+		super().__init__(discord.ui.Button(label=label, emoji=emoji, style=discord.ButtonStyle.red, custom_id=f"bonfire_end:{poll_id}", disabled=closed))
 		self.poll_id = poll_id
+
+	@classmethod
+	async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match):
+		return cls(int(match["poll_id"]))
 
 	async def callback(self, interaction: discord.Interaction):
 		creator_hash = db.get_poll_creator_hash(self.poll_id)
@@ -245,9 +257,7 @@ class PollView(discord.ui.LayoutView):
 
 		vote_row = discord.ui.ActionRow()
 		for i, option in enumerate(options):
-			button = VoteButton(poll_id, i, option)
-			button.disabled = closed
-			vote_row.add_item(button)
+			vote_row.add_item(VoteButton(poll_id, i, option, disabled=closed))
 		container.add_item(vote_row)
 
 		action_row = discord.ui.ActionRow()

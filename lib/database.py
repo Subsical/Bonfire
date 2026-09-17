@@ -4,46 +4,79 @@ from datetime import datetime, timezone
 
 import sqlcipher3 as sqlite3
 
-conn = sqlite3.connect('bonfire.db')
-cur = conn.cursor()
-cur.execute(f"PRAGMA key=\"{os.environ['BONFIRE_DB_KEY']}\"")
+DB_PATH = os.environ.get('BONFIRE_DB_PATH', 'data/bonfire.db')
 
-# CREATE TABLE IF NOT EXISTS Polls (
-#	poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
-#	message_id INTEGER UNIQUE,
-#	channel_id INTEGER NOT NULL,
-#	guild_id INTEGER,
-#	question TEXT NOT NULL,
-#	options TEXT NOT NULL,
-#	thread_id INTEGER,
-#	creator_hash TEXT NOT NULL,
-#	expires_at TEXT NOT NULL,
-#	closed INTEGER NOT NULL DEFAULT 0,
-#	reply_count INTEGER NOT NULL DEFAULT 0,
-#	last_reply TEXT,
-#	last_reply_at TEXT,
-#	supports_replies INTEGER NOT NULL DEFAULT 1
-# )
+def open_connection(path: str = DB_PATH):
+	connection = sqlite3.connect(path)
+	cursor = connection.cursor()
+	cursor.execute(f"PRAGMA key=\"{os.environ['BONFIRE_DB_KEY']}\"")
+	cursor.execute("PRAGMA journal_mode=WAL")
+	cursor.execute("PRAGMA busy_timeout=5000")
+	cursor.execute("PRAGMA synchronous=NORMAL")
+	return connection, cursor
 
-# CREATE TABLE IF NOT EXISTS Votes (
-#	poll_id INTEGER NOT NULL,
-#	voter_hash TEXT NOT NULL,
-#	option_index INTEGER NOT NULL,
-#	PRIMARY KEY (poll_id, voter_hash)
-# )
+conn, cur = open_connection()
 
-# CREATE TABLE IF NOT EXISTS Reminders (
-#	reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
-#	user_id INTEGER NOT NULL,
-#	channel_id INTEGER NOT NULL,
-#	guild_id INTEGER,
-#	message TEXT NOT NULL,
-#	remind_at TEXT NOT NULL,
-#	repeat TEXT NOT NULL DEFAULT 'none',
-#	pre_offsets TEXT NOT NULL DEFAULT '',
-#	sent_offsets TEXT NOT NULL DEFAULT '',
-#	created_at TEXT NOT NULL
-# )
+####### =================================================================== #######
+
+MIGRATIONS = [
+	[
+		"""CREATE TABLE IF NOT EXISTS Polls (
+			poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			message_id INTEGER UNIQUE,
+			channel_id INTEGER NOT NULL,
+			question TEXT NOT NULL,
+			options TEXT NOT NULL,
+			thread_id INTEGER,
+			creator_hash TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			closed INTEGER NOT NULL DEFAULT 0,
+			reply_count INTEGER NOT NULL DEFAULT 0,
+			last_reply TEXT,
+			last_reply_at TEXT,
+			supports_replies INTEGER NOT NULL DEFAULT 1,
+			guild_id INTEGER
+		)""",
+		"""CREATE TABLE IF NOT EXISTS Votes (
+			poll_id INTEGER NOT NULL,
+			voter_hash TEXT NOT NULL,
+			option_index INTEGER NOT NULL,
+			PRIMARY KEY (poll_id, voter_hash)
+		)""",
+		"""CREATE TABLE IF NOT EXISTS Reminders (
+			reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			channel_id INTEGER NOT NULL,
+			guild_id INTEGER,
+			message TEXT NOT NULL,
+			remind_at TEXT NOT NULL,
+			repeat TEXT NOT NULL DEFAULT 'none',
+			pre_offsets TEXT NOT NULL DEFAULT '',
+			sent_offsets TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		)""",
+	], [
+		"CREATE INDEX IF NOT EXISTS idx_polls_open_expiry ON Polls(expires_at) WHERE closed = 0",
+		"CREATE INDEX IF NOT EXISTS idx_reminders_remind_at ON Reminders(remind_at)",
+		"CREATE INDEX IF NOT EXISTS idx_reminders_pre ON Reminders(remind_at) WHERE pre_offsets != ''",
+		"CREATE INDEX IF NOT EXISTS idx_reminders_user ON Reminders(user_id, remind_at)",
+		"CREATE INDEX IF NOT EXISTS idx_polls_guild ON Polls(guild_id, poll_id DESC)",
+	], [
+		"ALTER TABLE Polls ADD COLUMN creator_key TEXT",
+		"CREATE INDEX IF NOT EXISTS idx_polls_creator ON Polls(creator_key, poll_id DESC)",
+	],
+]
+
+def migrate():
+	version, = cur.execute("PRAGMA user_version").fetchone()
+	for number, statements in enumerate(MIGRATIONS[version:], start=version + 1):
+		for statement in statements:
+			cur.execute(statement)
+		cur.execute(f"PRAGMA user_version = {number}")
+		conn.commit()
+		print(f"Applied database migration {number}.")
+
+migrate()
 
 ####### =================================================================== #######
 
@@ -53,12 +86,17 @@ def hash_voter(user_id: int, poll_id: int) -> str:
 	raw = f"{user_id}:{poll_id}:{salt}".encode()
 	return hashlib.sha256(raw).hexdigest()
 
+def creator_key(user_id: int) -> str:
+	"""One-way hash of a user, stable across polls so the website can find the ones they made"""
+	salt = os.environ['BONFIRE_CREATOR_SALT']
+	raw = f"{user_id}:{salt}".encode()
+	return hashlib.sha256(raw).hexdigest()
+
 ####### =================================================================== #######
 
 def create_poll(channel_id: int, creator_id: int, question: str, options: list[str], expires_at: str, supports_replies: bool = True, guild_id: int | None = None) -> int:
-	"""Inserts a new poll and returns its poll_id. message_id starts NULL, not 0, so a failed poll
-	can't block a later one via the UNIQUE constraint."""
-	cur.execute("INSERT INTO Polls (message_id, channel_id, guild_id, question, options, creator_hash, expires_at, supports_replies) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (None, channel_id, guild_id, question, "\x1f".join(options), "", expires_at, int(supports_replies)))
+	"""Inserts a new poll and returns its poll_id. message_id starts NULL, not 0, so a failed poll can't block a later one."""
+	cur.execute("INSERT INTO Polls (message_id, channel_id, guild_id, question, options, creator_hash, creator_key, expires_at, supports_replies) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (None, channel_id, guild_id, question, "\x1f".join(options), "", creator_key(creator_id), expires_at, int(supports_replies)))
 	poll_id = cur.lastrowid
 	cur.execute("UPDATE Polls SET creator_hash = ? WHERE poll_id = ?", (hash_voter(creator_id, poll_id), poll_id))
 	conn.commit()
@@ -67,11 +105,6 @@ def create_poll(channel_id: int, creator_id: int, question: str, options: list[s
 def set_message_id(poll_id: int, message_id: int):
 	cur.execute("UPDATE Polls SET message_id = ? WHERE poll_id = ?", (message_id, poll_id))
 	conn.commit()
-
-def all_poll_views_data() -> list[tuple]:
-	"""Gets (poll_id, options, closed) for every stored poll, used to reattach persistent views on startup"""
-	cur.execute("SELECT poll_id, options, closed FROM Polls")
-	return cur.fetchall()
 
 def expired_poll_ids() -> list[int]:
 	now_iso = datetime.now(timezone.utc).isoformat()
@@ -128,6 +161,48 @@ def is_closed(poll_id: int) -> bool:
 	cur.execute("SELECT closed FROM Polls WHERE poll_id = ?", (poll_id,))
 	closed, = cur.fetchone()
 	return bool(closed)
+
+####### ========================= dashboard reads ========================= #######
+
+# Paged, unlike list_polls
+def polls_by_creator(key: str, limit: int = 50, offset: int = 0) -> list[tuple]:
+	cur.execute(
+		"SELECT poll_id, question, closed, expires_at, channel_id, message_id, guild_id "
+		"FROM Polls WHERE creator_key = ? ORDER BY poll_id DESC LIMIT ? OFFSET ?",
+		(key, limit, offset)
+	)
+	return cur.fetchall()
+
+def polls_by_guild(guild_id: int, limit: int = 50, offset: int = 0) -> list[tuple]:
+	cur.execute(
+		"SELECT poll_id, question, closed, expires_at, channel_id, message_id, guild_id "
+		"FROM Polls WHERE guild_id = ? ORDER BY poll_id DESC LIMIT ? OFFSET ?",
+		(guild_id, limit, offset)
+	)
+	return cur.fetchall()
+
+def count_polls_by_creator(key: str) -> int:
+	cur.execute("SELECT COUNT(*) FROM Polls WHERE creator_key = ?", (key,))
+	total, = cur.fetchone()
+	return total
+
+def count_polls_by_guild(guild_id: int) -> int:
+	cur.execute("SELECT COUNT(*) FROM Polls WHERE guild_id = ?", (guild_id,))
+	total, = cur.fetchone()
+	return total
+
+def owns_poll(poll_id: int, key: str) -> bool:
+	cur.execute("SELECT 1 FROM Polls WHERE poll_id = ? AND creator_key = ?", (poll_id, key))
+	return cur.fetchone() is not None
+
+def guilds_with_polls() -> list[int]:
+	cur.execute("SELECT DISTINCT guild_id FROM Polls WHERE guild_id IS NOT NULL")
+	return [guild_id for guild_id, in cur.fetchall()]
+
+def count_reminders_by_guild(guild_id: int) -> int:
+	cur.execute("SELECT COUNT(*) FROM Reminders WHERE guild_id = ?", (guild_id,))
+	total, = cur.fetchone()
+	return total
 
 def set_question(poll_id: int, question: str):
 	cur.execute("UPDATE Polls SET question = ? WHERE poll_id = ?", (question, poll_id))

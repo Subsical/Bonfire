@@ -70,9 +70,7 @@ async def on_ready():
 		await asyncio.to_thread(write_last_sync_hash, current_hash)
 		print("Command definitions changed, synced with Discord.")
 
-	# reattach persistent views
-	for poll_id, options_raw, closed in db.all_poll_views_data():
-		bot.add_view(polls.PollView(poll_id, options_raw.split("\x1f"), closed=bool(closed)))
+	bot.add_dynamic_items(polls.VoteButton, polls.ReplyButton, polls.EndPollButton)
 
 	check_expired_polls.start()
 	check_reminders.start()
