@@ -17,9 +17,13 @@ from lib import *
 
 
 class Bonfire(commands.Bot):
+	api_runner = None
+
 	async def close(self):
 		"""Do cleanup before the bot shuts down."""
 		await games.shutdown()
+		if self.api_runner is not None:
+			await self.api_runner.cleanup()
 		await super().close()
 
 bot = Bonfire(command_prefix='!', intents=discord.Intents.all(), help_command=None)
@@ -72,9 +76,26 @@ async def on_ready():
 
 	bot.add_dynamic_items(polls.VoteButton, polls.ReplyButton, polls.EndPollButton)
 
+	db.sync_guilds([(g.id, g.name, g.icon.key if g.icon else None) for g in bot.guilds])
+
+	if bot.api_runner is None:
+		bot.api_runner = await api.start(bot)
+
 	check_expired_polls.start()
 	check_reminders.start()
 	print("---OUTPUT----------\nBonfire is here.")
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+	db.add_guild(guild.id, guild.name, guild.icon.key if guild.icon else None)
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+	db.remove_guild(guild.id)
+
+@bot.event
+async def on_guild_update(before: discord.Guild, after: discord.Guild):
+	db.add_guild(after.id, after.name, after.icon.key if after.icon else None)
 
 @bot.event
 async def on_resumed():
@@ -155,6 +176,7 @@ async def poll(
 	"""
 	options = [o for o in (option1, option2, option3, option4, option5) if o]
 	assert len(options) <= 5, "Polls can have at most 5 options."
+	assert db.module_enabled(interaction.guild_id, "polls"), "Polls are turned off in this server."
 	assert interaction.guild_id is None or bot.get_guild(interaction.guild_id) is not None, "Bonfire needs to be added to this server for /poll to work here."
 
 	target_channel = interaction.channel
@@ -310,6 +332,17 @@ async def polls_reopen(interaction: discord.Interaction, poll_id: int, duration:
 	await interaction.response.send_message(f"{theme.SUC} Poll #{poll_id} reopened.", ephemeral=True)
 
 ####### =================================================================== #######
+
+@polls_group.command(name="delete")
+@app_commands.autocomplete(poll_id=poll_id_autocomplete)
+async def polls_delete(interaction: discord.Interaction, poll_id: int):
+	"""Delete a poll and its votes for good, and remove its message.
+
+	:param poll_id: Which poll (start typing its name to search)
+	"""
+	assert db.get_poll(poll_id, filter_guild_id(interaction)) is not None, "That poll doesn't exist in this server."
+	await polls.delete_poll(bot, poll_id)
+	await interaction.response.send_message(f"{theme.SUC} Poll #{poll_id} deleted.", ephemeral=True)
 
 @bot.tree.command(name="deletepoll", guild=DEV_GUILD)
 @app_commands.autocomplete(poll_id=poll_id_autocomplete)
@@ -659,8 +692,9 @@ vs_group = app_commands.Group(
 )
 bot.tree.add_command(vs_group)
 
-async def start_game(interaction: discord.Interaction, title: str, build, opponent: discord.User | None):
+async def start_game(interaction: discord.Interaction, key: str, title: str, build, opponent: discord.User | None):
 	"""Posts a challenge. A named opponent has to accept it; with none, anyone can take it."""
+	assert db.module_enabled(interaction.guild_id, f"games:{key}"), f"{title} is turned off in this server."
 	assert opponent is None or not opponent.bot, "You can't play against a bot!"
 	assert opponent is None or opponent.id != interaction.user.id, "You can't play against yourself!"
 	assert not games.busy(interaction.user), "You're already in a game!."
@@ -678,7 +712,7 @@ async def vs_rps(interaction: discord.Interaction, opponent: discord.User | None
 
 	:param opponent: Play against a specific user
 	"""
-	await start_game(interaction, "✊ Rock Paper Scissors",
+	await start_game(interaction, "rps", "✊ Rock Paper Scissors",
 		lambda accepter: games.RPSView(interaction.user, accepter), opponent)
 
 @vs_group.command(name="tictactoe")
@@ -687,7 +721,7 @@ async def vs_tictactoe(interaction: discord.Interaction, opponent: discord.User 
 
 	:param opponent: Play against a specific user
 	"""
-	await start_game(interaction, "⭕ Tic Tac Toe",
+	await start_game(interaction, "tictactoe", "⭕ Tic Tac Toe",
 		lambda accepter: games.TicTacToeView(interaction.user, accepter), opponent)
 
 @vs_group.command(name="connectfour")
@@ -696,7 +730,7 @@ async def vs_connectfour(interaction: discord.Interaction, opponent: discord.Use
 
 	:param opponent: Play against a specific user
 	"""
-	await start_game(interaction, "🧮 Connect Four",
+	await start_game(interaction, "connectfour", "🧮 Connect Four",
 		lambda accepter: games.ConnectFourView(interaction.user, accepter), opponent)
 
 @vs_group.command(name="battleship")
@@ -705,7 +739,7 @@ async def vs_battleship(interaction: discord.Interaction, opponent: discord.User
 
 	:param opponent: Play against a specific user
 	"""
-	await start_game(interaction, f"{games.BATTLESHIP} Battleship",
+	await start_game(interaction, "battleship", f"{games.BATTLESHIP} Battleship",
 		lambda accepter: games.BattleshipView(interaction.user, accepter), opponent)
 
 ####### =================================================================== #######

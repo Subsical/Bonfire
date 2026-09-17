@@ -64,6 +64,19 @@ MIGRATIONS = [
 	], [
 		"ALTER TABLE Polls ADD COLUMN creator_key TEXT",
 		"CREATE INDEX IF NOT EXISTS idx_polls_creator ON Polls(creator_key, poll_id DESC)",
+	], [
+		"""CREATE TABLE IF NOT EXISTS Guilds (
+			guild_id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			icon TEXT,
+			joined_at TEXT NOT NULL
+		)""",
+	], [
+		"""CREATE TABLE IF NOT EXISTS DisabledModules (
+			guild_id INTEGER NOT NULL,
+			module TEXT NOT NULL,
+			PRIMARY KEY (guild_id, module)
+		)""",
 	],
 ]
 
@@ -300,3 +313,48 @@ def set_sent_offsets(reminder_id: int, offsets: list[int]):
 def delete_reminder(reminder_id: int):
 	cur.execute("DELETE FROM Reminders WHERE reminder_id = ?", (reminder_id,))
 	conn.commit()
+
+####### =================================================================== #######
+
+def sync_guilds(guilds: list[tuple]):
+	"""Replaces the stored server list with what the bot can currently see."""
+	cur.execute("DELETE FROM Guilds")
+	cur.executemany(
+		"INSERT INTO Guilds (guild_id, name, icon, joined_at) VALUES (?, ?, ?, ?)",
+		[(gid, name, icon, datetime.now(timezone.utc).isoformat()) for gid, name, icon in guilds]
+	)
+	conn.commit()
+
+def add_guild(guild_id: int, name: str, icon: str | None):
+	cur.execute(
+		"INSERT INTO Guilds (guild_id, name, icon, joined_at) VALUES (?, ?, ?, ?) "
+		"ON CONFLICT(guild_id) DO UPDATE SET name = excluded.name, icon = excluded.icon",
+		(guild_id, name, icon, datetime.now(timezone.utc).isoformat())
+	)
+	conn.commit()
+
+def remove_guild(guild_id: int):
+	cur.execute("DELETE FROM Guilds WHERE guild_id = ?", (guild_id,))
+	conn.commit()
+
+def disabled_modules(guild_id: int) -> set[str]:
+	cur.execute("SELECT module FROM DisabledModules WHERE guild_id = ?", (guild_id,))
+	return {module for module, in cur.fetchall()}
+
+def set_module(guild_id: int, module: str, enabled: bool):
+	if enabled:
+		cur.execute("DELETE FROM DisabledModules WHERE guild_id = ? AND module = ?", (guild_id, module))
+	else:
+		cur.execute("INSERT OR IGNORE INTO DisabledModules (guild_id, module) VALUES (?, ?)", (guild_id, module))
+	conn.commit()
+
+def module_enabled(guild_id: int | None, module: str) -> bool:
+	"""Check if a module is enabled in the given guild."""
+	if guild_id is None:
+		return True
+	keys = [module]
+	if ":" in module:
+		keys.append(module.split(":", 1)[0])
+	placeholders = ",".join("?" * len(keys))
+	cur.execute(f"SELECT 1 FROM DisabledModules WHERE guild_id = ? AND module IN ({placeholders})", (guild_id, *keys))  # noqa: S608
+	return cur.fetchone() is None

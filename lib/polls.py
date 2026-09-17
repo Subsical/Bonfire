@@ -118,6 +118,23 @@ async def close_poll(bot: discord.Client, poll_id: int, interaction: discord.Int
 	except discord.Forbidden:
 		pass
 
+async def delete_poll(bot: discord.Client, poll_id: int):
+	"""Removes the poll and its votes, and deletes the message so no dead buttons are left."""
+	ref = db.get_poll_message_ref(poll_id)
+	db.delete_poll(poll_id)
+	if ref is None:
+		return
+	channel_id, message_id, _, guild_id = ref
+	if message_id is None:
+		return
+	channel = await get_channel(bot, channel_id, guild_id)
+	if channel is None:
+		return
+	try:
+		await (await channel.fetch_message(message_id)).delete()
+	except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+		pass
+
 async def refresh_poll_message(bot: discord.Client, poll_id: int):
 	"""Re-renders a poll's live message. Fails silently if the message is not found."""
 	ref = db.get_poll_message_ref(poll_id)
