@@ -102,6 +102,12 @@ async def on_resumed():
 	print("// resumed session")
 
 @bot.event
+async def on_message(message: discord.Message):
+	# a rule that waits on embeds would otherwise hold commands up behind it
+	asyncio.create_task(autoresponses.handle(bot, message))
+	await bot.process_commands(message)
+
+@bot.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
 	await games.abandon(payload.message_id)
 
@@ -741,6 +747,92 @@ async def vs_battleship(interaction: discord.Interaction, opponent: discord.User
 	"""
 	await start_game(interaction, "battleship", f"{games.BATTLESHIP} Battleship",
 		lambda accepter: games.BattleshipView(interaction.user, accepter), opponent)
+
+####### =========================== autoresponses ========================== #######
+
+class AutoResponsesGroup(app_commands.Group):
+	async def interaction_check(self, interaction: discord.Interaction) -> bool:
+		if not isinstance(interaction.user, discord.Member) or interaction.guild is None:
+			await interaction.response.send_message("Only the server owner or an administrator can use this.", ephemeral=True)
+			return False
+		is_owner = interaction.user.id == interaction.guild.owner_id
+		is_admin = interaction.user.guild_permissions.administrator
+		if not (is_owner or is_admin):
+			await interaction.response.send_message("Only the server owner or an administrator can use this.", ephemeral=True)
+			return False
+		return True
+
+autoresponse_group = AutoResponsesGroup(
+	name="autoresponse", description="Manage this server's autoresponses (admin only)",
+	allowed_installs=app_commands.AppInstallationType(guild=True, user=False),
+	allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False),
+	default_permissions=discord.Permissions(administrator=True),
+)
+bot.tree.add_command(autoresponse_group)
+
+async def rule_id_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+	if interaction.guild_id is None:
+		return []
+	choices = []
+	for rule_id, name, enabled, *_ in db.guild_rules(interaction.guild_id, only_enabled=False):
+		label = f"#{rule_id} - {name}" + ("" if enabled else " (off)")
+		if current.lower() in label.lower():
+			choices.append(app_commands.Choice(name=label[:100], value=rule_id))
+	return choices[:25]
+
+@autoresponse_group.command(name="list", description="Every autoresponse in this server")
+async def autoresponse_list(interaction: discord.Interaction):
+	rules = db.guild_rules(interaction.guild_id, only_enabled=False)
+	if not rules:
+		await interaction.response.send_message("No autoresponses set up yet.", ephemeral=True)
+		return
+
+	lines = []
+	for rule_id, name, enabled, priority, conditions, actions, cooldown in rules:
+		try:
+			kinds = [step.get("type", "?") for step in json.loads(actions)]
+		except json.JSONDecodeError:
+			kinds = ["(unreadable)"]
+		state = "on" if enabled else "off"
+		lines.append(f"`#{rule_id}` **{name}** - {state}, priority {priority} - {', '.join(kinds)}")
+
+	embed = discord.Embed(title="Autoresponses", description="\n".join(lines)[:4000], color=theme.COLOR_MAIN)
+	await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@autoresponse_group.command(name="toggle", description="Turn one autoresponse on or off")
+@app_commands.describe(rule="Which autoresponse", enabled="Whether it should run")
+@app_commands.autocomplete(rule=rule_id_autocomplete)
+async def autoresponse_toggle(interaction: discord.Interaction, rule: int, enabled: bool):
+	existing = db.get_rule(rule, interaction.guild_id)
+	assert existing, "That autoresponse doesn't exist in this server."
+	db.update_rule(rule, interaction.guild_id, enabled=int(enabled))
+	await interaction.response.send_message(
+		f"{theme.SUC} **{existing[1]}** is now {'on' if enabled else 'off'}.", ephemeral=True
+	)
+
+@autoresponse_group.command(name="delete", description="Delete an autoresponse")
+@app_commands.describe(rule="Which autoresponse")
+@app_commands.autocomplete(rule=rule_id_autocomplete)
+async def autoresponse_delete(interaction: discord.Interaction, rule: int):
+	existing = db.get_rule(rule, interaction.guild_id)
+	assert existing, "That autoresponse doesn't exist in this server."
+	db.delete_rule(rule, interaction.guild_id)
+	autoresponses.forget_rule(rule)
+	await interaction.response.send_message(f"{theme.SUC} Deleted **{existing[1]}**.", ephemeral=True)
+
+@autoresponse_group.command(name="show", description="What one autoresponse checks for, and what it does")
+@app_commands.describe(rule="Which autoresponse")
+@app_commands.autocomplete(rule=rule_id_autocomplete)
+async def autoresponse_show(interaction: discord.Interaction, rule: int):
+	existing = db.get_rule(rule, interaction.guild_id)
+	assert existing, "That autoresponse doesn't exist in this server."
+	rule_id, name, enabled, priority, conditions, actions, cooldown = existing
+
+	embed = discord.Embed(title=name, color=theme.COLOR_MAIN)
+	embed.add_field(name="Conditions", value=f"```json\n{conditions[:1000]}\n```", inline=False)
+	embed.add_field(name="Actions", value=f"```json\n{actions[:1000]}\n```", inline=False)
+	embed.set_footer(text=f"#{rule_id} - {'on' if enabled else 'off'} - priority {priority} - cooldown {cooldown}s")
+	await interaction.response.send_message(embed=embed, ephemeral=True)
 
 ####### =================================================================== #######
 

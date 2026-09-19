@@ -1,11 +1,16 @@
+import hmac
+import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 
+import discord
 from aiohttp import web
 
+from lib import autoresponses
 from lib import database as db
-from lib import polls
+from lib import polls, reminders
 
 MODULES = {
 	"polls", "reaction-roles", "autoresponses", "games",
@@ -28,7 +33,7 @@ def _too_fast(guild_id: int) -> bool:
 
 def _authorised(request: web.Request) -> bool:
 	secret = os.environ.get("BOT_API_SECRET")
-	return bool(secret) and request.headers.get("X-Bot-Secret") == secret
+	return bool(secret) and hmac.compare_digest(request.headers.get("X-Bot-Secret", ""), secret)
 
 async def get_modules(request: web.Request):
 	if not _authorised(request):
@@ -69,6 +74,245 @@ async def get_info(request: web.Request):
 		"roles": len(guild.roles) - 1,  # exclude @everyone
 	})
 
+async def get_choices(request: web.Request):
+	"""Channels, categories and roles, so the website can offer real names to pick from."""
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	guild = request.app["bot"].get_guild(int(request.match_info["guild_id"]))
+	if guild is None:
+		raise web.HTTPNotFound()
+
+	channels = []
+	# categories first, each followed by its own channels, so the website can show
+	# the same shape people already see in Discord
+	for category, contents in guild.by_category():
+		inside = [
+			{
+				"id": str(channel.id), "name": channel.name,
+				"kind": "forum" if isinstance(channel, discord.ForumChannel) else "channel",
+				"parent": str(category.id) if category else None,
+			}
+			for channel in contents
+			if isinstance(channel, (discord.TextChannel, discord.ForumChannel))
+		]
+		if category is not None:
+			channels.append({"id": str(category.id), "name": category.name, "kind": "category", "parent": None})
+		channels.extend(inside)
+
+	roles = [
+		{"id": str(role.id), "name": role.name, "colour": f"#{role.colour.value:06X}" if role.colour.value else None}
+		for role in reversed(guild.roles) if not role.is_default()
+	]
+	return web.json_response({"channels": channels, "roles": roles})
+
+async def get_rules(request: web.Request):
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	guild_id = int(request.match_info["guild_id"])
+	rules = [
+		{
+			"id": rule_id, "name": name, "enabled": bool(enabled), "priority": priority,
+			"conditions": json.loads(conditions), "actions": json.loads(actions), "cooldown": cooldown,
+		}
+		for rule_id, name, enabled, priority, conditions, actions, cooldown in db.guild_rules(guild_id, only_enabled=False)
+	]
+	return web.json_response({"rules": rules})
+
+async def save_rule(request: web.Request):
+	"""Creates a rule, or replaces one when the body carries an id."""
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	guild_id = int(request.match_info["guild_id"])
+	if request.app["bot"].get_guild(guild_id) is None:
+		raise web.HTTPNotFound()
+	if _too_fast(guild_id):
+		raise web.HTTPTooManyRequests(text="Slow down.")
+
+	body = await request.json()
+	try:
+		fields = autoresponses.validate(body)
+	except ValueError as error:
+		raise web.HTTPBadRequest(text=str(error)) from error
+
+	rule_id = body.get("id")
+	if rule_id is None:
+		if db.count_rules(guild_id) >= autoresponses.MAX_RULES:
+			raise web.HTTPBadRequest(text=f"A server can have at most {autoresponses.MAX_RULES} autoresponses.")
+		rule_id = db.create_rule(
+			guild_id, fields["name"], json.dumps(fields["conditions"]), json.dumps(fields["actions"]),
+			priority=fields["priority"], cooldown=fields["cooldown"],
+		)
+	else:
+		rule_id = int(rule_id)
+		if db.get_rule(rule_id, guild_id) is None:
+			raise web.HTTPNotFound()
+		db.update_rule(
+			rule_id, guild_id,
+			name=fields["name"], conditions=json.dumps(fields["conditions"]),
+			actions=json.dumps(fields["actions"]), priority=fields["priority"],
+			cooldown=fields["cooldown"], enabled=int(fields["enabled"]),
+		)
+	return web.json_response({"id": rule_id})
+
+async def toggle_rule(request: web.Request):
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	guild_id = int(request.match_info["guild_id"])
+	rule_id = int(request.match_info["rule_id"])
+	if db.get_rule(rule_id, guild_id) is None:
+		raise web.HTTPNotFound()
+	if _too_fast(guild_id):
+		raise web.HTTPTooManyRequests(text="Slow down.")
+
+	body = await request.json()
+	db.update_rule(rule_id, guild_id, enabled=int(bool(body.get("enabled"))))
+	return web.json_response({"id": rule_id, "enabled": bool(body.get("enabled"))})
+
+async def delete_rule(request: web.Request):
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	guild_id = int(request.match_info["guild_id"])
+	rule_id = int(request.match_info["rule_id"])
+	if db.get_rule(rule_id, guild_id) is None:
+		raise web.HTTPNotFound()
+	if _too_fast(guild_id):
+		raise web.HTTPTooManyRequests(text="Slow down.")
+
+	db.delete_rule(rule_id, guild_id)
+	autoresponses.forget_rule(rule_id)
+	return web.json_response({"deleted": rule_id})
+
+class FieldError(ValueError):
+	"""A validation failure the website can point at a particular box."""
+
+	def __init__(self, field: str, message: str):
+		super().__init__(message)
+		self.field = field
+
+def _reminder_target(bot, body: dict, user_id: int):
+	"""Where a reminder should be sent, checking the user may actually post there.
+	Returns (channel_id, guild_id) or raises."""
+	channel_id = body.get("channel_id")
+	if not channel_id:
+		raise web.HTTPBadRequest(text=json.dumps({"detail": "Pick a channel for the reminder.", "field": "channel_id"}), content_type="application/json")
+
+	channel = bot.get_channel(int(channel_id))
+	if channel is None or channel.guild is None:
+		raise web.HTTPBadRequest(text=json.dumps({"detail": "I can't see that channel.", "field": "channel_id"}), content_type="application/json")
+
+	member = channel.guild.get_member(user_id)
+	if member is None:
+		raise web.HTTPForbidden(text=json.dumps({"detail": "You aren't in that server.", "field": "channel_id"}), content_type="application/json")
+	permissions = channel.permissions_for(member)
+	if not (permissions.view_channel and permissions.send_messages):
+		raise web.HTTPForbidden(text=json.dumps({"detail": "You don't have permission to post in that channel.", "field": "channel_id"}), content_type="application/json")
+	if not channel.permissions_for(channel.guild.me).send_messages:
+		raise web.HTTPBadRequest(text=json.dumps({"detail": "I can't post in that channel.", "field": "channel_id"}), content_type="application/json")
+	return channel.id, channel.guild.id
+
+def _reminder_fields(body: dict):
+	"""Shared checks for creating and editing, so both reject the same things."""
+	message = str(body.get("message") or "").strip()
+	if not message:
+		raise FieldError("message", "A reminder needs a message.")
+	if len(message) > reminders.MAX_MESSAGE_LENGTH:
+		raise FieldError("message", f"Keep it under {reminders.MAX_MESSAGE_LENGTH} characters.")
+
+	try:
+		remind_at = reminders.parse_when(str(body.get("when") or ""))
+	except ValueError as error:
+		raise FieldError("when", str(error)) from error
+	try:
+		pre_offsets = reminders.parse_pre_offsets(body.get("pre_reminders") or None)
+	except ValueError as error:
+		raise FieldError("pre_reminders", str(error)) from error
+
+	now = datetime.now(timezone.utc)
+	if remind_at <= now:
+		raise FieldError("when", "That time has already passed.")
+	if any(remind_at - timedelta(seconds=o) <= now for o in pre_offsets):
+		raise FieldError("pre_reminders", "One of those early nudges would already be in the past.")
+
+	repeat = str(body.get("repeat") or "none")
+	if repeat not in reminders.REPEATS:
+		raise FieldError("repeat", "That isn't a repeat option we know.")
+	return message, remind_at, repeat, pre_offsets
+
+async def get_reminders(request: web.Request):
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	user_id = int(request.match_info["user_id"])
+	rows = [
+		{
+			"id": reminder_id, "message": message, "remind_at": remind_at,
+			"repeat": repeat, "pre_offsets": pre_offsets,
+			"channel_id": str(channel_id), "guild_id": str(guild_id) if guild_id else None,
+		}
+		for reminder_id, message, remind_at, repeat, pre_offsets, channel_id, guild_id in db.list_reminders(user_id)
+	]
+	return web.json_response({"reminders": rows})
+
+async def save_reminder(request: web.Request):
+	"""Creates a reminder, or replaces one when the body carries an id."""
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	user_id = int(request.match_info["user_id"])
+	body = await request.json()
+	if _too_fast(user_id):
+		raise web.HTTPTooManyRequests(text="Slow down.")
+
+	try:
+		message, remind_at, repeat, pre_offsets = _reminder_fields(body)
+	except ValueError as error:
+		raise web.HTTPBadRequest(
+			text=json.dumps({"detail": str(error), "field": getattr(error, "field", None)}),
+			content_type="application/json",
+		) from error
+	channel_id, guild_id = _reminder_target(request.app["bot"], body, user_id)
+
+	reminder_id = body.get("id")
+	if reminder_id is None:
+		if len(db.list_reminders(user_id)) >= reminders.MAX_PER_USER:
+			raise web.HTTPBadRequest(text=f"You already have {reminders.MAX_PER_USER} reminders, delete one first.")
+		reminder_id = db.create_reminder(
+			user_id, channel_id, guild_id, message, remind_at.isoformat(), repeat, pre_offsets)
+	else:
+		reminder_id = int(reminder_id)
+		if db.get_reminder(reminder_id, user_id) is None:
+			raise web.HTTPNotFound()
+		db.update_reminder(
+			reminder_id, user_id, message=message, remind_at=remind_at.isoformat(),
+			repeat=repeat, pre_offsets=pre_offsets, channel_id=channel_id, guild_id=guild_id)
+	return web.json_response({"id": reminder_id})
+
+async def delete_reminder(request: web.Request):
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	user_id = int(request.match_info["user_id"])
+	reminder_id = int(request.match_info["reminder_id"])
+	if _too_fast(user_id):
+		raise web.HTTPTooManyRequests(text="Slow down.")
+	if not db.delete_reminder_for(reminder_id, user_id):
+		raise web.HTTPNotFound()
+	return web.json_response({"deleted": reminder_id})
+
+async def get_writable_channels(request: web.Request):
+	"""Channels this person can actually post in, for the reminder channel picker."""
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	user_id = int(request.match_info["user_id"])
+	out = []
+	for guild in request.app["bot"].guilds:
+		member = guild.get_member(user_id)
+		if member is None:
+			continue
+		for channel in guild.text_channels:
+			permissions = channel.permissions_for(member)
+			if permissions.view_channel and permissions.send_messages \
+					and channel.permissions_for(guild.me).send_messages:
+				out.append({"id": str(channel.id), "name": channel.name, "guild": guild.name})
+	return web.json_response({"channels": out})
+
 async def delete_poll(request: web.Request):
 	if not _authorised(request):
 		raise web.HTTPUnauthorized()
@@ -92,6 +336,15 @@ async def start(bot, port: int = 8081):
 		web.get("/guilds/{guild_id}/modules", get_modules),
 		web.post("/guilds/{guild_id}/modules", set_module),
 		web.delete("/guilds/{guild_id}/polls/{poll_id}", delete_poll),
+		web.get("/guilds/{guild_id}/choices", get_choices),
+		web.get("/guilds/{guild_id}/rules", get_rules),
+		web.post("/guilds/{guild_id}/rules", save_rule),
+		web.post("/guilds/{guild_id}/rules/{rule_id}/enabled", toggle_rule),
+		web.delete("/guilds/{guild_id}/rules/{rule_id}", delete_rule),
+		web.get("/users/{user_id}/reminders", get_reminders),
+		web.post("/users/{user_id}/reminders", save_reminder),
+		web.delete("/users/{user_id}/reminders/{reminder_id}", delete_reminder),
+		web.get("/users/{user_id}/channels", get_writable_channels),
 	])
 	runner = web.AppRunner(app)
 	await runner.setup()

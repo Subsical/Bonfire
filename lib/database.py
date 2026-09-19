@@ -77,6 +77,19 @@ MIGRATIONS = [
 			module TEXT NOT NULL,
 			PRIMARY KEY (guild_id, module)
 		)""",
+	], [
+		"""CREATE TABLE IF NOT EXISTS AutoResponses (
+			rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			guild_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			priority INTEGER NOT NULL DEFAULT 0,
+			conditions TEXT NOT NULL,
+			actions TEXT NOT NULL,
+			cooldown INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		)""",
+		"CREATE INDEX IF NOT EXISTS idx_autoresponses_guild ON AutoResponses(guild_id, priority, rule_id)",
 	],
 ]
 
@@ -314,6 +327,28 @@ def delete_reminder(reminder_id: int):
 	cur.execute("DELETE FROM Reminders WHERE reminder_id = ?", (reminder_id,))
 	conn.commit()
 
+def update_reminder(reminder_id: int, user_id: int, **fields):
+	"""Scoped to the owner, so a reminder id from elsewhere can't be edited through it."""
+	allowed = {"message", "remind_at", "repeat", "pre_offsets", "channel_id", "guild_id"}
+	changes = {key: value for key, value in fields.items() if key in allowed}
+	if not changes:
+		return False
+	if "pre_offsets" in changes and isinstance(changes["pre_offsets"], list):
+		changes["pre_offsets"] = ",".join(str(o) for o in changes["pre_offsets"])
+	assignments = ", ".join(f"{key} = ?" for key in changes)
+	# a changed time means the early nudges it already sent no longer apply
+	cur.execute(
+		f"UPDATE Reminders SET {assignments}, sent_offsets = '' WHERE reminder_id = ? AND user_id = ?",  # noqa: S608
+		(*changes.values(), reminder_id, user_id),
+	)
+	conn.commit()
+	return cur.rowcount > 0
+
+def delete_reminder_for(reminder_id: int, user_id: int) -> bool:
+	cur.execute("DELETE FROM Reminders WHERE reminder_id = ? AND user_id = ?", (reminder_id, user_id))
+	conn.commit()
+	return cur.rowcount > 0
+
 ####### =================================================================== #######
 
 def sync_guilds(guilds: list[tuple]):
@@ -358,3 +393,51 @@ def module_enabled(guild_id: int | None, module: str) -> bool:
 	placeholders = ",".join("?" * len(keys))
 	cur.execute(f"SELECT 1 FROM DisabledModules WHERE guild_id = ? AND module IN ({placeholders})", (guild_id, *keys))  # noqa: S608
 	return cur.fetchone() is None
+
+####### ============================ autoresponses ========================= #######
+
+def create_rule(guild_id: int, name: str, conditions: str, actions: str, priority: int = 0, cooldown: int = 0) -> int:
+	cur.execute(
+		"INSERT INTO AutoResponses (guild_id, name, conditions, actions, priority, cooldown, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		(guild_id, name, conditions, actions, priority, cooldown, datetime.now(timezone.utc).isoformat()),
+	)
+	conn.commit()
+	return cur.lastrowid
+
+def guild_rules(guild_id: int, only_enabled: bool = True) -> list[tuple]:
+	"""Ordered the way they're evaluated: priority first, then oldest."""
+	query = "SELECT rule_id, name, enabled, priority, conditions, actions, cooldown FROM AutoResponses WHERE guild_id = ?"
+	if only_enabled:
+		query += " AND enabled = 1"
+	cur.execute(query + " ORDER BY priority DESC, rule_id", (guild_id,))
+	return cur.fetchall()
+
+def get_rule(rule_id: int, guild_id: int):
+	"""Scoped to the guild, so a rule id from elsewhere can't be read through it."""
+	cur.execute(
+		"SELECT rule_id, name, enabled, priority, conditions, actions, cooldown FROM AutoResponses WHERE rule_id = ? AND guild_id = ?",
+		(rule_id, guild_id),
+	)
+	return cur.fetchone()
+
+def update_rule(rule_id: int, guild_id: int, **fields):
+	allowed = {"name", "enabled", "priority", "conditions", "actions", "cooldown"}
+	changes = {key: value for key, value in fields.items() if key in allowed}
+	if not changes:
+		return
+	assignments = ", ".join(f"{key} = ?" for key in changes)
+	cur.execute(
+		f"UPDATE AutoResponses SET {assignments} WHERE rule_id = ? AND guild_id = ?",  # noqa: S608
+		(*changes.values(), rule_id, guild_id),
+	)
+	conn.commit()
+
+def delete_rule(rule_id: int, guild_id: int) -> bool:
+	cur.execute("DELETE FROM AutoResponses WHERE rule_id = ? AND guild_id = ?", (rule_id, guild_id))
+	conn.commit()
+	return cur.rowcount > 0
+
+def count_rules(guild_id: int) -> int:
+	cur.execute("SELECT COUNT(*) FROM AutoResponses WHERE guild_id = ?", (guild_id,))
+	total, = cur.fetchone()
+	return total
