@@ -125,6 +125,20 @@ MIGRATIONS = [
 			timezone TEXT NOT NULL DEFAULT '',
 			tz_manual INTEGER NOT NULL DEFAULT 0
 		)""",
+	], [
+		"""CREATE TABLE IF NOT EXISTS RobloxFriends (
+			roblox_id INTEGER PRIMARY KEY,
+			last_used TEXT NOT NULL
+		)""",
+		"CREATE INDEX IF NOT EXISTS idx_robloxfriends_used ON RobloxFriends(last_used)",
+	], [
+		"""CREATE TABLE IF NOT EXISTS RobloxAccounts (
+			user_id INTEGER PRIMARY KEY,
+			roblox_id INTEGER NOT NULL,
+			username TEXT NOT NULL,
+			linked_at TEXT NOT NULL
+		)""",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_robloxaccounts_roblox ON RobloxAccounts(roblox_id)",
 	],
 ]
 
@@ -595,3 +609,55 @@ def remove_panel_option(panel_id: int, role_id: int) -> bool:
 	cur.execute("DELETE FROM RolePanelOptions WHERE panel_id = ? AND role_id = ?", (panel_id, role_id))
 	conn.commit()
 	return cur.rowcount > 0
+
+####### =================================================================== #######
+
+def touch_roblox_friend(roblox_id: int):
+	"""Marks someone as still using /roblox, so they aren't unfriended for being idle."""
+	cur.execute(
+		"INSERT INTO RobloxFriends (roblox_id, last_used) VALUES (?, ?) "
+		"ON CONFLICT(roblox_id) DO UPDATE SET last_used = excluded.last_used",
+		(roblox_id, datetime.now(timezone.utc).isoformat()),
+	)
+	conn.commit()
+
+def stale_roblox_friends(before: str) -> list[int]:
+	cur.execute("SELECT roblox_id FROM RobloxFriends WHERE last_used < ?", (before,))
+	return [row[0] for row in cur.fetchall()]
+
+def known_roblox_friends() -> set[int]:
+	cur.execute("SELECT roblox_id FROM RobloxFriends")
+	return {row[0] for row in cur.fetchall()}
+
+def link_roblox_account(user_id: int, roblox_id: int, username: str) -> bool:
+	"""Ties a Discord user to the Roblox account they proved they own."""
+	owner = roblox_account_owner(roblox_id)
+	if owner is not None and owner != user_id:
+		return False
+	cur.execute(
+		"INSERT INTO RobloxAccounts (user_id, roblox_id, username, linked_at) VALUES (?, ?, ?, ?) "
+		"ON CONFLICT(user_id) DO UPDATE SET roblox_id = excluded.roblox_id, "
+		"username = excluded.username, linked_at = excluded.linked_at",
+		(user_id, roblox_id, username, datetime.now(timezone.utc).isoformat()),
+	)
+	conn.commit()
+	return True
+
+def linked_roblox_account(user_id: int) -> tuple[int, str] | None:
+	cur.execute("SELECT roblox_id, username FROM RobloxAccounts WHERE user_id = ?", (user_id,))
+	return cur.fetchone()
+
+def unlink_roblox_account(user_id: int) -> bool:
+	cur.execute("DELETE FROM RobloxAccounts WHERE user_id = ?", (user_id,))
+	conn.commit()
+	return cur.rowcount > 0
+
+def roblox_account_owner(roblox_id: int) -> int | None:
+	"""Which Discord user proved they own this Roblox account, if any."""
+	cur.execute("SELECT user_id FROM RobloxAccounts WHERE roblox_id = ?", (roblox_id,))
+	row = cur.fetchone()
+	return row[0] if row else None
+
+def forget_roblox_friend(roblox_id: int):
+	cur.execute("DELETE FROM RobloxFriends WHERE roblox_id = ?", (roblox_id,))
+	conn.commit()

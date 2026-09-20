@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from zoneinfo import available_timezones
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -85,6 +86,8 @@ async def on_ready():
 
 	check_expired_polls.start()
 	check_reminders.start()
+	if roblox.helper_configured():
+		tend_roblox_friends.start()
 	# only looks at panels still marked as someone else's, so it stops costing anything
 	await reactionroles.reclaim_panels(bot)
 	print("---OUTPUT----------\nBonfire is here.")
@@ -154,11 +157,13 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+	# a deferred command has already responded, so the message has to be a followup
+	send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
 	# cooldowns are raised before the command runs, so there's no .original on them
 	if isinstance(error, app_commands.CommandOnCooldown):
-		await interaction.response.send_message(f"{theme.ERR} Slow down! Try again in {error.retry_after:.1f}s.", ephemeral=True)
+		await send(f"{theme.ERR} Slow down! Try again in {error.retry_after:.1f}s.", ephemeral=True)
 	elif isinstance(getattr(error, "original", None), AssertionError):
-		await interaction.response.send_message(f"{theme.ERR} {error.original}", ephemeral=True)
+		await send(f"{theme.ERR} {error.original}", ephemeral=True)
 	else:
 		raise error
 
@@ -1234,6 +1239,301 @@ async def reactionroles_delete(interaction: discord.Interaction, panel: int):
 	await interaction.response.defer(ephemeral=True)
 	await reactionroles.delete_panel(bot, panel, interaction.guild_id)
 	await interaction.followup.send(f"{theme.SUC} Deleted **{found['title']}**.", ephemeral=True)
+
+####### =================================================================== #######
+
+FRIEND_IDLE_DAYS = 30
+
+@tasks.loop(minutes=1)
+async def tend_roblox_friends():
+	"""Takes new friend requests, and drops anyone who stopped using the command."""
+	async with aiohttp.ClientSession(timeout=roblox.TIMEOUT) as session:
+		try:
+			# also settles who the helper account is, for the link in the privacy notice
+			await roblox.helper_id(session)
+			accepted = await roblox.accept_friend_requests(session)
+			friends = await roblox.friend_ids(session)
+		except roblox.RobloxError:
+			return
+
+		# friending us from the account they claimed is what proves it's theirs
+		for roblox_id in accepted:
+			db.touch_roblox_friend(roblox_id)
+			claim = _roblox_claims.pop(roblox_id, None)
+			if claim is None:
+				continue
+			user_id, display, origin = claim
+			# someone may have linked it in the time the claim was waiting
+			if not db.link_roblox_account(user_id, roblox_id, display):
+				continue
+			# the ephemeral message still says to send a request, so say it worked
+			try:
+				await origin.edit_original_response(view=roblox_linked_notice(display))
+			except discord.HTTPException:
+				pass
+
+		drop_stale_claims()
+
+		# a friend we never recorded still takes up a slot, so start their clock now
+		known = db.known_roblox_friends()
+		for roblox_id in friends:
+			if roblox_id not in known:
+				db.touch_roblox_friend(roblox_id)
+
+		# Roblox caps a friend list at 1000, so idle people make room for new ones
+		cutoff = (datetime.now(timezone.utc) - timedelta(days=FRIEND_IDLE_DAYS)).isoformat()
+		on_list = set(friends)
+		for roblox_id in db.stale_roblox_friends(cutoff):
+			if roblox_id in on_list:
+				try:
+					await roblox.unfriend(session, roblox_id)
+				except roblox.RobloxError:
+					continue
+			db.forget_roblox_friend(roblox_id)
+
+@tend_roblox_friends.before_loop
+async def before_tend_roblox_friends():
+	await bot.wait_until_ready()
+
+def roblox_privacy_notice(display: str, theirs: bool) -> discord.ui.LayoutView:
+	"""Shown when joins are private. Only your own account can be opted in."""
+	if theirs:
+		whose, reason = "your", "Your joins are off. Set them to friends or everyone."
+	else:
+		whose, reason = f"**{display}**'s", "Their joins aren't set to everyone."
+
+	container = discord.ui.Container(accent_color=theme.COLOR_ERROR)
+	container.add_item(discord.ui.TextDisplay(f"## {theme.ERR} Can't see {whose} server\n{reason}"))
+
+	profile = roblox.helper_url()
+	if not theirs:
+		container.add_item(discord.ui.Separator())
+		if profile:
+			container.add_item(discord.ui.TextDisplay(
+				"I only read friend-only joins for the account owner.\n"
+				"If it's yours, link it with `/robloxaccount link`."
+			))
+			row = discord.ui.ActionRow()
+			row.add_item(discord.ui.Button(label="My Roblox account", style=discord.ButtonStyle.link, url=profile))
+			container.add_item(row)
+		else:
+			container.add_item(discord.ui.TextDisplay("You'll have to ask them for an invite."))
+
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	return view
+
+@bot.tree.command(name="roblox")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def roblox_command(
+	interaction: discord.Interaction, game: str | None = None,
+	username: app_commands.Range[str, 1, roblox.MAX_USERNAME_LENGTH] | None = None,
+	jobid: str | None = None,
+):
+	"""Send a link that joins a Roblox game.
+
+	:param game: The game's link or ID (not needed if you give a username)
+	:param username: Join the server this person is in, if their joins are public
+	:param jobid: Join this exact server
+	"""
+	if not game and not username and not jobid:
+		linked = db.linked_roblox_account(interaction.user.id)
+		if linked:
+			username = linked[1]
+
+	assert game or username, "Provide a game link or a username to join."
+	await interaction.response.defer()
+
+	async with aiohttp.ClientSession(timeout=roblox.TIMEOUT) as session:
+		try:
+			place_id = roblox.parse_place(game) if game else None
+			job_id = roblox.parse_job(jobid)
+			found_via = None
+
+			# a username with no job id is a request to follow them into their server
+			if username and job_id is None:
+				roblox_id, display = await roblox.user_id(session, username)
+				where = await roblox.presence(session, roblox_id)
+				# only your own account, or following someone would beat their privacy
+				theirs = db.roblox_account_owner(roblox_id) == interaction.user.id
+				if theirs and not where.get("gameId"):
+					where = await roblox.presence_as_helper(session, roblox_id) or where
+					db.touch_roblox_friend(roblox_id)
+
+				kind = where.get("userPresenceType")
+				assert kind != roblox.OFFLINE, f"**{display}** is offline."
+				assert kind != roblox.IN_STUDIO, f"**{display}** is in Studio, not a game."
+				assert kind == roblox.IN_GAME, f"**{display}** isn't in a game right now."
+
+				if not where.get("gameId") or not where.get("placeId"):
+					await interaction.followup.send(
+						view=roblox_privacy_notice(display, theirs), ephemeral=True,
+						allowed_mentions=discord.AllowedMentions.none(),
+					)
+					return
+
+				job_id = where["gameId"]
+				place_id = where["placeId"]
+				found_via = display
+
+			details = await roblox.place_details(session, place_id)
+			icon = await roblox.icon_url(session, details["universe_id"])
+			alternatives = [] if job_id else await roblox.servers(session, place_id, limit=10)
+		except roblox.RobloxError as error:
+			await interaction.followup.send(f"{theme.ERR} {error}", ephemeral=True)
+			return
+
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	header = discord.ui.TextDisplay(
+		f"## [{details['name']}]({roblox.page_url(place_id)})\n> By {details['creator']}"
+	)
+	if icon:
+		container.add_item(discord.ui.Section(header, accessory=discord.ui.Thumbnail(icon, description="Game icon")))
+	else:
+		container.add_item(header)
+
+	container.add_item(discord.ui.Separator())
+
+	lines = [f"**{details['playing']:,}** playing right now"]
+	if found_via:
+		lines.append(f"Following **{found_via}** into their server.")
+	elif job_id:
+		lines.append("Joining a specific server.")
+	container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+
+	row = discord.ui.ActionRow()
+	row.add_item(discord.ui.Button(label="Join", style=discord.ButtonStyle.link, url=roblox.join_url(place_id, job_id)))
+	if alternatives:
+		spot = alternatives[0]
+		row.add_item(discord.ui.Button(
+			label=f"Emptiest server ({spot['playing']}/{spot['maxPlayers']})",
+			style=discord.ButtonStyle.link, url=roblox.join_url(place_id, spot["id"]),
+		))
+	container.add_item(row)
+
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	await interaction.followup.send(view=view, allowed_mentions=discord.AllowedMentions.none())
+
+####### =================================================================== #######
+
+# roblox_id -> (discord id, username, interaction) waiting on a friend request
+_roblox_claims: dict[int, tuple[int, str, discord.Interaction]] = {}
+
+def drop_stale_claims():
+	"""Frees a username someone claimed and then never friended us from."""
+	cutoff = discord.utils.utcnow() - timedelta(minutes=15)
+	for roblox_id, claim in list(_roblox_claims.items()):
+		if claim[2].created_at < cutoff:
+			del _roblox_claims[roblox_id]
+
+def roblox_linked_notice(display: str) -> discord.ui.LayoutView:
+	"""Replace the waiting message once the friend request settles the link"""
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	container.add_item(discord.ui.TextDisplay(
+		f"## {theme.SUC} Linked to **{display}**\n"
+		f"`/roblox username:{display}` can now find your server on friends-only joins."
+	))
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	return view
+
+robloxaccount_group = app_commands.Group(
+	name="robloxaccount", description="Link your Roblox account to Bonfire",
+	allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+	allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True),
+)
+bot.tree.add_command(robloxaccount_group)
+
+@robloxaccount_group.command(name="link")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def robloxaccount_link(
+	interaction: discord.Interaction,
+	username: app_commands.Range[str, 1, roblox.MAX_USERNAME_LENGTH],
+):
+	"""Link your Roblox account, so /roblox can find your own server.
+
+	:param username: Your Roblox username
+	"""
+	assert roblox.helper_configured(), "Roblox account linking isn't set up right now."
+	await interaction.response.defer(ephemeral=True)
+
+	async with aiohttp.ClientSession(timeout=roblox.TIMEOUT) as session:
+		try:
+			roblox_id, display = await roblox.user_id(session, username)
+
+			# the interaction is deferred, so problems are sent rather than asserted
+			owner = db.roblox_account_owner(roblox_id)
+			if owner == interaction.user.id:
+				await interaction.followup.send(f"{theme.SUC} You're already linked to **{display}**.", ephemeral=True)
+				return
+			if owner is not None:
+				await interaction.followup.send(f"{theme.ERR} Someone else has already linked that Roblox account.", ephemeral=True)
+				return
+			# first claim wins, or someone else's friend request would finish our link for them
+			claimed = _roblox_claims.get(roblox_id)
+			if claimed is not None and claimed[0] != interaction.user.id:
+				await interaction.followup.send(f"{theme.ERR} Someone else is already linking that Roblox account.", ephemeral=True)
+				return
+
+			# an old friendship says nothing about who's asking now, so it has to be sent again
+			if await roblox.befriended(session, roblox_id):
+				await roblox.unfriend(session, roblox_id)
+				db.forget_roblox_friend(roblox_id)
+		except roblox.RobloxError as error:
+			await interaction.followup.send(f"{theme.ERR} {error}", ephemeral=True)
+			return
+
+	_roblox_claims[roblox_id] = (interaction.user.id, display, interaction)
+
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	container.add_item(discord.ui.TextDisplay(
+		f"## Linking **{display}**\n"
+		"Send my Roblox account a friend request from that account.\n"
+		"The request will be accepted automatically, and proving your account ownership."
+	))
+	row = discord.ui.ActionRow()
+	row.add_item(discord.ui.Button(
+		label="Add my Roblox account", style=discord.ButtonStyle.link, url=roblox.helper_url(),
+	))
+	container.add_item(row)
+	container.add_item(discord.ui.TextDisplay("-# Being friends is also what lets me read friends-only joins."))
+
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	await interaction.followup.send(view=view, ephemeral=True)
+
+@robloxaccount_group.command(name="status")
+async def robloxaccount_status(interaction: discord.Interaction):
+	"""Check which Roblox account you're linked to."""
+	linked = db.linked_roblox_account(interaction.user.id)
+	waiting = next((claim[1] for claim in _roblox_claims.values() if claim[0] == interaction.user.id), None)
+	assert linked is not None or waiting is None, f"Still waiting on a friend request from **{waiting}**."
+	assert linked is not None, "You haven't linked a Roblox account. Try `/robloxaccount link`."
+	await interaction.response.send_message(f"{theme.SUC} Linked to **{linked[1]}**.", ephemeral=True)
+
+@robloxaccount_group.command(name="unlink")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def robloxaccount_unlink(interaction: discord.Interaction):
+	"""Forget the Roblox account you linked."""
+	linked = db.linked_roblox_account(interaction.user.id)
+	assert linked is not None, "You haven't linked a Roblox account."
+	for roblox_id, claim in list(_roblox_claims.items()):
+		if claim[0] == interaction.user.id:
+			del _roblox_claims[roblox_id]
+
+	await interaction.response.defer(ephemeral=True)
+	db.unlink_roblox_account(interaction.user.id)
+	# leaving the friendship would let a later claim be settled by their own re-add
+	async with aiohttp.ClientSession(timeout=roblox.TIMEOUT) as session:
+		try:
+			await roblox.unfriend(session, linked[0])
+		except roblox.RobloxError:
+			pass
+	db.forget_roblox_friend(linked[0])
+	await interaction.followup.send(f"{theme.SUC} Unlinked from **{linked[1]}**.", ephemeral=True)
 
 ####### =================================================================== #######
 
