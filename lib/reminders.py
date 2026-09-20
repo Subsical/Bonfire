@@ -1,11 +1,24 @@
 import calendar
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 
 from lib import database as db
 from lib import theme
+
+# what the timezone picker offers before anyone types, since the full list is 600 long
+COMMON_ZONES = {
+	"UTC", "Europe/London", "Europe/Dublin", "Europe/Lisbon", "Europe/Madrid",
+	"Europe/Paris", "Europe/Berlin", "Europe/Amsterdam", "Europe/Brussels",
+	"Europe/Rome", "Europe/Stockholm", "Europe/Warsaw", "Europe/Athens",
+	"Europe/Helsinki", "Europe/Kyiv", "Europe/Moscow", "Europe/Istanbul",
+	"America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+	"America/Toronto", "America/Vancouver", "America/Sao_Paulo", "Asia/Tokyo",
+	"Asia/Seoul", "Asia/Shanghai", "Asia/Singapore", "Asia/Kolkata", "Asia/Dubai",
+	"Australia/Sydney", "Australia/Perth", "Pacific/Auckland",
+}
 
 MAX_MESSAGE_LENGTH = 500
 MAX_PER_USER = 25
@@ -28,7 +41,38 @@ def parse_duration(text: str) -> int:
 		raise ValueError("That duration has to be longer than zero.")
 	return total
 
-def parse_when(text: str) -> datetime:
+def is_absolute(text: str) -> bool:
+	"""Whether this is a date someone typed, rather than a duration or a timestamp."""
+	value = text.strip()
+	if re.fullmatch(r"<t:\d+(?::[tTdDfFR])?>", value) or value.isdigit():
+		return False
+	return any(_parses(value, pattern) for pattern in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"))
+
+def _parses(value: str, pattern: str) -> bool:
+	try:
+		datetime.strptime(value, pattern)
+	except ValueError:
+		return False
+	return True
+
+def valid_zone(name: str) -> bool:
+	"""Whether this is a timezone the system knows, like Europe/Berlin."""
+	try:
+		ZoneInfo(name)
+	except (ZoneInfoNotFoundError, ValueError):
+		return False
+	return True
+
+def zone_of(user_id: int | None) -> ZoneInfo:
+	"""Someone's timezone, falling back to UTC when they've never set one."""
+	if user_id is None:
+		return ZoneInfo("UTC")
+	try:
+		return ZoneInfo(db.get_timezone(user_id) or "UTC")
+	except (ZoneInfoNotFoundError, ValueError):
+		return ZoneInfo("UTC")
+
+def parse_when(text: str, user_id: int | None = None) -> datetime:
 	"""When a reminder should fire. Takes a duration, a unix timestamp, a Discord <t:...> stamp, or a plain date."""
 	value = text.strip()
 
@@ -42,11 +86,13 @@ def parse_when(text: str) -> datetime:
 		except (ValueError, OSError, OverflowError):
 			raise ValueError(f"`{text.strip()}` is not a valid timestamp.") from None
 
+	# a date someone types is the time on their own clock, not UTC
 	for pattern in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
 		try:
-			return datetime.strptime(value, pattern).replace(tzinfo=timezone.utc)
+			naive = datetime.strptime(value, pattern)
 		except ValueError:
 			continue
+		return naive.replace(tzinfo=zone_of(user_id)).astimezone(timezone.utc)
 
 	return datetime.now(timezone.utc) + timedelta(seconds=parse_duration(value))
 

@@ -11,7 +11,7 @@ from aiohttp import web
 
 from lib import autoresponses
 from lib import database as db
-from lib import polls, reminders
+from lib import polls, reactionroles, reminders
 
 MODULES = {
 	"polls", "reaction-roles", "autoresponses", "games",
@@ -235,7 +235,7 @@ async def _reminder_target(bot, body: dict, user_id: int):
 		raise web.HTTPBadRequest(text=json.dumps({"detail": "I can't post in that channel.", "field": "channel_id"}), content_type="application/json")
 	return channel.id, channel.guild.id
 
-def _reminder_fields(body: dict):
+def _reminder_fields(body: dict, user_id: int):
 	"""Shared checks for creating and editing, so both reject the same things."""
 	message = str(body.get("message") or "").strip()
 	if not message:
@@ -244,7 +244,7 @@ def _reminder_fields(body: dict):
 		raise FieldError("message", f"Keep it under {reminders.MAX_MESSAGE_LENGTH} characters.")
 
 	try:
-		remind_at = reminders.parse_when(str(body.get("when") or ""))
+		remind_at = reminders.parse_when(str(body.get("when") or ""), user_id)
 	except ValueError as error:
 		raise FieldError("when", str(error)) from error
 	try:
@@ -307,6 +307,29 @@ def _mention_names(bot, text: str) -> dict:
 			names[raw] = {"name": user.display_name, "kind": "user"} if user else None
 	return {raw: entry for raw, entry in names.items() if entry}
 
+async def get_timezone(request: web.Request):
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	user_id = int(request.match_info["user_id"])
+	return web.json_response({
+		"timezone": db.get_timezone(user_id),
+		"manual": db.timezone_is_manual(user_id),
+	})
+
+async def set_timezone(request: web.Request):
+	"""The website sends this on sign in, and when someone picks one by hand."""
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	user_id = int(request.match_info["user_id"])
+	body = await request.json()
+	name = str(body.get("timezone") or "").strip()
+	manual = bool(body.get("manual"))
+	if name and not reminders.valid_zone(name):
+		raise web.HTTPBadRequest(text="That isn't a timezone I know.")
+	stored = db.set_timezone(user_id, name, manual)
+	# a hand-picked zone is never overwritten by the automatic one
+	return web.json_response({"timezone": db.get_timezone(user_id), "changed": stored})
+
 async def get_reminders(request: web.Request):
 	if not _authorised(request):
 		raise web.HTTPUnauthorized()
@@ -334,7 +357,7 @@ async def save_reminder(request: web.Request):
 		raise web.HTTPTooManyRequests(text="Slow down.")
 
 	try:
-		message, remind_at, repeat, pre_offsets = _reminder_fields(body)
+		message, remind_at, repeat, pre_offsets = _reminder_fields(body, user_id)
 	except ValueError as error:
 		raise web.HTTPBadRequest(
 			text=json.dumps({"detail": str(error), "field": getattr(error, "field", None)}),
@@ -400,6 +423,118 @@ async def delete_poll(request: web.Request):
 	await polls.delete_poll(request.app["bot"], poll_id)
 	return web.json_response({"deleted": poll_id})
 
+async def get_panels(request: web.Request):
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	guild_id = int(request.match_info["guild_id"])
+	panels = []
+	for row in db.guild_panels(guild_id):
+		panel = reactionroles.panel_dict(row)
+		panel["options"] = reactionroles.options_of(panel["id"])
+		panel["guild_id"] = str(panel["guild_id"])
+		panel["channel_id"] = str(panel["channel_id"])
+		panel["message_id"] = str(panel["message_id"]) if panel["message_id"] else None
+		for option in panel["options"]:
+			option["role_id"] = str(option["role_id"])
+		panels.append(panel)
+	return web.json_response({"panels": panels})
+
+async def save_panel(request: web.Request):
+	"""Creates a panel, or replaces one when the body carries an id."""
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	guild_id = int(request.match_info["guild_id"])
+	bot = request.app["bot"]
+	guild = bot.get_guild(guild_id)
+	if guild is None:
+		raise web.HTTPNotFound()
+	if _too_fast(guild_id):
+		raise web.HTTPTooManyRequests(text="Slow down.")
+
+	body = await request.json()
+	panel_id = body.get("id")
+
+	# what the panel has to carry depends on whether Bonfire can write the message
+	channel = channel_id = message_id = None
+	owned = True
+	if panel_id is None:
+		if db.count_panels(guild_id) >= reactionroles.MAX_PANELS:
+			raise web.HTTPBadRequest(text=f"A server can have at most {reactionroles.MAX_PANELS} panels.")
+		try:
+			channel_id = int(body.get("channel_id"))
+		except (TypeError, ValueError) as error:
+			raise web.HTTPBadRequest(text="Pick a channel for the panel.") from error
+		channel = guild.get_channel(channel_id)
+		if channel is None:
+			raise web.HTTPBadRequest(text="That channel isn't in this server.")
+
+		if str(body.get("message_id") or "").strip():
+			try:
+				message_id = reactionroles.message_id_from(body["message_id"], guild_id)
+			except ValueError as error:
+				raise web.HTTPBadRequest(text=str(error)) from error
+			if db.panel_by_message(message_id) is not None:
+				raise web.HTTPBadRequest(text="That message already has a panel on it.")
+			try:
+				adopted = await channel.fetch_message(message_id)
+			except (discord.NotFound, discord.Forbidden) as error:
+				raise web.HTTPBadRequest(text="I can't find that message in that channel.") from error
+			# a message Bonfire sent itself can still be edited, so it counts as its own
+			owned = adopted.author.id == bot.user.id
+	else:
+		panel_id = int(panel_id)
+		existing = reactionroles.get_panel(panel_id, guild_id)
+		if existing is None:
+			raise web.HTTPNotFound()
+		owned = existing["owned"]
+
+	try:
+		fields = reactionroles.validate(body, owned)
+	except ValueError as error:
+		raise web.HTTPBadRequest(text=str(error)) from error
+	# a panel on someone else's message can only ever be reactions
+	if not owned and fields["style"] != "reaction":
+		raise web.HTTPBadRequest(text="A panel on an existing message can only use reactions.")
+
+	if body.get("id") is None:
+		panel_id = db.create_panel(
+			guild_id, channel_id, fields["title"], fields["style"], fields["mode"],
+			limit_count=fields["limit"], content=fields["content"],
+			embed=json.dumps(fields["embed"]) if fields["embed"] else None,
+			owned=owned, message_id=message_id, per_row=fields["per_row"],
+		)
+	else:
+		db.update_panel(
+			panel_id, guild_id, title=fields["title"], content=fields["content"],
+			embed=json.dumps(fields["embed"]) if fields["embed"] else None,
+			style=fields["style"], mode=fields["mode"], limit_count=fields["limit"],
+			per_row=fields["per_row"],
+		)
+
+	db.set_panel_options(panel_id, [
+		(option["role_id"], option["emoji"], option["label"], option["description"])
+		for option in fields["options"]
+	])
+	# the panel is saved either way, so a posting problem is reported, not raised
+	try:
+		await reactionroles.refresh_panel(bot, panel_id)
+	except discord.HTTPException as error:
+		raise web.HTTPBadGateway(text=f"Saved, but I couldn't post it: {error.text or error}") from error
+	return web.json_response({"id": panel_id})
+
+async def delete_panel(request: web.Request):
+	if not _authorised(request):
+		raise web.HTTPUnauthorized()
+	guild_id = int(request.match_info["guild_id"])
+	panel_id = int(request.match_info["panel_id"])
+	if reactionroles.get_panel(panel_id, guild_id) is None:
+		raise web.HTTPNotFound()
+	if _too_fast(guild_id):
+		raise web.HTTPTooManyRequests(text="Slow down.")
+
+	await reactionroles.delete_panel(request.app["bot"], panel_id, guild_id)
+	return web.json_response({"deleted": panel_id})
+
 async def start(bot, port: int = 8081):
 	app = web.Application()
 	app["bot"] = bot
@@ -413,6 +548,11 @@ async def start(bot, port: int = 8081):
 		web.post("/guilds/{guild_id}/rules", save_rule),
 		web.post("/guilds/{guild_id}/rules/{rule_id}/enabled", toggle_rule),
 		web.delete("/guilds/{guild_id}/rules/{rule_id}", delete_rule),
+		web.get("/guilds/{guild_id}/panels", get_panels),
+		web.post("/guilds/{guild_id}/panels", save_panel),
+		web.delete("/guilds/{guild_id}/panels/{panel_id}", delete_panel),
+		web.get("/users/{user_id}/timezone", get_timezone),
+		web.post("/users/{user_id}/timezone", set_timezone),
 		web.get("/users/{user_id}/reminders", get_reminders),
 		web.post("/users/{user_id}/reminders", save_reminder),
 		web.delete("/users/{user_id}/reminders/{reminder_id}", delete_reminder),

@@ -4,10 +4,12 @@ import io
 import json
 import os
 import random
+import re
 import signal
 import traceback
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
+from zoneinfo import available_timezones
 
 import discord
 from discord import app_commands
@@ -74,7 +76,7 @@ async def on_ready():
 		await asyncio.to_thread(write_last_sync_hash, current_hash)
 		print("Command definitions changed, synced with Discord.")
 
-	bot.add_dynamic_items(polls.VoteButton, polls.ReplyButton, polls.EndPollButton)
+	bot.add_dynamic_items(polls.VoteButton, polls.ReplyButton, polls.EndPollButton, reactionroles.RoleButton, reactionroles.RoleSelect)
 
 	db.sync_guilds([(g.id, g.name, g.icon.key if g.icon else None) for g in bot.guilds])
 
@@ -83,6 +85,8 @@ async def on_ready():
 
 	check_expired_polls.start()
 	check_reminders.start()
+	# only looks at panels still marked as someone else's, so it stops costing anything
+	await reactionroles.reclaim_panels(bot)
 	print("---OUTPUT----------\nBonfire is here.")
 
 @bot.event
@@ -115,6 +119,14 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
 async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
 	for message_id in payload.message_ids:
 		await games.abandon(message_id)
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+	await reactionroles.on_reaction(bot, payload, adding=True)
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+	await reactionroles.on_reaction(bot, payload, adding=False)
 
 ####### =================================================================== #######
 
@@ -616,11 +628,9 @@ async def reminder_add(
 	:param pre_reminders: List of reminders about the upcoming reminder separated by commas, like `1d, 1h`
 	"""
 	assert not (dm and channel is not None), "Pick a channel or your DMs, not both."
-	# Discord has no way to hide a parameter per context, so it's rejected instead
 	assert not (channel is not None and interaction.guild is None), "Picking a channel only works inside a server."
 
 	if dm:
-		# a DM reminder carries no guild, which is what deliver() treats as DM-only
 		target = await interaction.user.create_dm()
 	else:
 		target = channel or interaction.channel
@@ -634,7 +644,7 @@ async def reminder_add(
 		assert channel.permissions_for(interaction.guild.me).send_messages, "I can't post in that channel."
 
 	try:
-		remind_at = reminders.parse_when(when)
+		remind_at = reminders.parse_when(when, interaction.user.id)
 		pre_offsets = reminders.parse_pre_offsets(pre_reminders)
 	except ValueError as error:
 		raise AssertionError(str(error)) from None
@@ -661,6 +671,9 @@ async def reminder_add(
 		lines.append(f"**Repeats:** {repeat_value}")
 	if pre_offsets:
 		lines.append(f"**Early nudges:** {', '.join(reminders.format_duration(o) for o in pre_offsets)}")
+	# a date means nothing without knowing whose clock it was on
+	if reminders.is_absolute(when) and not db.get_timezone(interaction.user.id):
+		lines.append("-# Read as UTC. Set yours with `/reminder timezone`.")
 
 	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
 	container.add_item(discord.ui.TextDisplay("\n".join(lines)))
@@ -692,7 +705,155 @@ async def reminder_list(interaction: discord.Interaction):
 	view.add_item(container)
 	await interaction.response.send_message(view=view, ephemeral=True)
 
+# rounding can tip a value up into the next unit
+_BIGGER = {"d": "w", "h": "d", "m": "h"}
+
+def _due_in(remind_at: str) -> str:
+	"""How far off a reminder is, for a label that can't carry a Discord timestamp."""
+	left = (datetime.fromisoformat(remind_at) - datetime.now(timezone.utc)).total_seconds()
+	if left < 0:
+		return "due"
+	if left < 60:
+		return "in under a minute"
+	# rounded inside the unit it reaches, so five hours isn't "in 4h"
+	for unit, size, per in (("w", 604800, None), ("d", 86400, 7), ("h", 3600, 24), ("m", 60, 60)):
+		if left >= size:
+			count = round(left / size)
+			return f"in {count}{unit}" if per is None or count < per else f"in 1{_BIGGER[unit]}"
+	return "in under a minute"
+
+async def timezone_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+	"""Matches against the system's timezone list as you type."""
+	typed = current.replace(" ", "_").lower()
+	zones = sorted(available_timezones())
+	# the full list means nothing before you type, so start with the common ones
+	if not typed:
+		zones = [zone for zone in zones if zone in reminders.COMMON_ZONES]
+	else:
+		zones = [zone for zone in zones if typed in zone.lower()]
+	return [app_commands.Choice(name=zone, value=zone) for zone in zones[:25]]
+
+@reminder_group.command(name="timezone")
+@app_commands.autocomplete(name=timezone_autocomplete)
+async def reminder_timezone(interaction: discord.Interaction, name: str | None = None):
+	"""Set the timezone your reminder times are read in.
+
+	:param name: Somewhere like Europe/Paris (leave empty to see what yours currently is)
+	"""
+	if name is None:
+		current = db.get_timezone(interaction.user.id)
+		if not current:
+			await interaction.response.send_message(
+				"You haven't set a timezone, so times you type are read as UTC. "
+				"Sign in to the website or use `/reminder timezone` to set one.", ephemeral=True)
+			return
+		now = datetime.now(reminders.zone_of(interaction.user.id))
+		how = "set by you" if db.timezone_is_manual(interaction.user.id) else "from the website"
+		await interaction.response.send_message(
+			f"Your timezone is **{current}** ({how}), where it's currently {now.strftime('%H:%M')}.", ephemeral=True)
+		return
+
+	assert reminders.valid_zone(name), f"I don't know a timezone called `{name}`. Try something like `Europe/Berlin`."
+	db.set_timezone(interaction.user.id, name, manual=True)
+	now = datetime.now(reminders.zone_of(interaction.user.id))
+	await interaction.response.send_message(
+		f"{theme.SUC} Timezone set to **{name}**, where it's currently {now.strftime('%H:%M')}. "
+		"Times you type from now on are read in that zone.", ephemeral=True)
+
+async def reminder_id_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+	"""Shows each reminder's message and how soon it's due, filtered live as you type."""
+	choices = []
+	for reminder_id, message, remind_at, _repeat, _pre, _channel, _guild in db.list_reminders(interaction.user.id):
+		label = f"#{reminder_id} - {_due_in(remind_at)} - {message}"
+		if current.lower() in label.lower():
+			choices.append(app_commands.Choice(name=label[:100], value=reminder_id))
+	return choices[:25]
+
+@reminder_group.command(name="edit")
+@app_commands.choices(repeat=[app_commands.Choice(name=r, value=r) for r in reminders.REPEATS])
+@app_commands.autocomplete(reminder_id=reminder_id_autocomplete)
+async def reminder_edit(
+	interaction: discord.Interaction, reminder_id: int,
+	when: str | None = None,
+	message: app_commands.Range[str, 1, reminders.MAX_MESSAGE_LENGTH] | None = None,
+	channel: discord.TextChannel | discord.VoiceChannel | discord.StageChannel | discord.Thread | None = None,
+	dm: bool | None = None,
+	repeat: app_commands.Choice[str] | None = None,
+	pre_reminders: str | None = None,
+):
+	"""Change one of your reminders.
+
+	:param reminder_id: See /reminder list to find the ID
+	:param when: A duration (`10m`, `1h30m`, `1w2d`), a date (`2026-10-16 17:30`), or a timestamp
+	:param message: What to remind you about
+	:param channel: Where to send it
+	:param dm: Send it to your DMs instead of a channel
+	:param repeat: Whether it should repeat (daily, weekly, monthly, yearly)
+	:param pre_reminders: List of reminders about the upcoming reminder separated by commas, like `1d, 1h`
+	"""
+	existing = db.get_reminder(reminder_id, interaction.user.id)
+	assert existing is not None, "You don't have a reminder with that ID."
+	assert not (dm and channel is not None), "Pick a channel or your DMs, not both."
+	assert not (channel is not None and interaction.guild is None), "Picking a channel only works inside a server."
+
+	changes = {}
+	if message is not None:
+		changes["message"] = message
+
+	if when is not None:
+		try:
+			remind_at = reminders.parse_when(when, interaction.user.id)
+		except ValueError as error:
+			raise AssertionError(str(error)) from None
+		assert remind_at > datetime.now(timezone.utc), "That time has already passed."
+		changes["remind_at"] = remind_at.isoformat()
+
+	if repeat is not None:
+		changes["repeat"] = repeat.value
+
+	if pre_reminders is not None:
+		try:
+			pre_offsets = reminders.parse_pre_offsets(pre_reminders)
+		except ValueError as error:
+			raise AssertionError(str(error)) from None
+		# they only make sense against whichever time the reminder ends up with
+		stamp = datetime.fromisoformat(changes.get("remind_at", existing[5]))
+		assert not any(stamp - timedelta(seconds=o) <= datetime.now(timezone.utc) for o in pre_offsets), \
+			"One of those pre-reminders would already be in the past."
+		changes["pre_offsets"] = pre_offsets
+
+	if dm:
+		target = await interaction.user.create_dm()
+		changes["channel_id"], changes["guild_id"] = target.id, None
+	elif channel is not None:
+		member = interaction.user if isinstance(interaction.user, discord.Member) else None
+		assert member is not None and channel.guild == interaction.guild, "You can only pick a channel in this server."
+		permissions = channel.permissions_for(member)
+		assert permissions.view_channel and permissions.send_messages, "You don't have permission to post in that channel."
+		assert channel.permissions_for(interaction.guild.me).send_messages, "I can't post in that channel."
+		changes["channel_id"], changes["guild_id"] = channel.id, interaction.guild_id
+
+	assert changes, "Tell me what to change."
+	db.update_reminder(reminder_id, interaction.user.id, **changes)
+
+	row = db.get_reminder(reminder_id, interaction.user.id)
+	stamp = int(datetime.fromisoformat(row[5]).timestamp())
+	lines = [f"### {theme.SUC} Reminder #{reminder_id} updated", row[4],
+		f"\n**When:** <t:{stamp}:F> (<t:{stamp}:R>)",
+		f"**Where:** <#{row[2]}>"]
+	if row[6] != "none":
+		lines.append(f"**Repeats:** {row[6]}")
+	if row[7]:
+		lines.append(f"**Early nudges:** {', '.join(reminders.format_duration(int(o)) for o in row[7].split(',') if o)}")
+
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	await interaction.response.send_message(view=view, ephemeral=True)
+
 @reminder_group.command(name="delete")
+@app_commands.autocomplete(reminder_id=reminder_id_autocomplete)
 async def reminder_delete(interaction: discord.Interaction, reminder_id: int):
 	"""Delete one of your reminders.
 
@@ -793,8 +954,9 @@ async def rule_id_autocomplete(interaction: discord.Interaction, current: str) -
 			choices.append(app_commands.Choice(name=label[:100], value=rule_id))
 	return choices[:25]
 
-@autoresponse_group.command(name="list", description="Every autoresponse in this server")
+@autoresponse_group.command(name="list")
 async def autoresponse_list(interaction: discord.Interaction):
+	"""List all the autoresponses in this server."""
 	rules = db.guild_rules(interaction.guild_id, only_enabled=False)
 	if not rules:
 		await interaction.response.send_message("No autoresponses set up yet.", ephemeral=True)
@@ -816,10 +978,14 @@ async def autoresponse_list(interaction: discord.Interaction):
 	embed = discord.Embed(title="Autoresponses", description="\n".join(lines)[:4000], color=theme.COLOR_MAIN)
 	await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@autoresponse_group.command(name="toggle", description="Turn one autoresponse on or off")
-@app_commands.describe(rule="Which autoresponse", enabled="Whether it should run")
+@autoresponse_group.command(name="toggle")
 @app_commands.autocomplete(rule=rule_id_autocomplete)
 async def autoresponse_toggle(interaction: discord.Interaction, rule: int, enabled: bool):
+	"""Toggle an autoresponse on or off.
+	
+	:param rule: Which autoresponse (start typing its name to search)
+	:param enabled: Whether it should run
+	"""
 	existing = db.get_rule(rule, interaction.guild_id)
 	assert existing, "That autoresponse doesn't exist in this server."
 	db.update_rule(rule, interaction.guild_id, enabled=int(enabled))
@@ -827,20 +993,26 @@ async def autoresponse_toggle(interaction: discord.Interaction, rule: int, enabl
 		f"{theme.SUC} **{existing[1]}** is now {'on' if enabled else 'off'}.", ephemeral=True
 	)
 
-@autoresponse_group.command(name="delete", description="Delete an autoresponse")
-@app_commands.describe(rule="Which autoresponse")
+@autoresponse_group.command(name="delete")
 @app_commands.autocomplete(rule=rule_id_autocomplete)
 async def autoresponse_delete(interaction: discord.Interaction, rule: int):
+	"""Delete an autoresponse from this server.
+	
+	:param rule: Which autoresponse (start typing its name to search)
+	"""
 	existing = db.get_rule(rule, interaction.guild_id)
 	assert existing, "That autoresponse doesn't exist in this server."
 	db.delete_rule(rule, interaction.guild_id)
 	autoresponses.forget_rule(rule)
 	await interaction.response.send_message(f"{theme.SUC} Deleted **{existing[1]}**.", ephemeral=True)
 
-@autoresponse_group.command(name="show", description="What one autoresponse checks for, and what it does")
-@app_commands.describe(rule="Which autoresponse")
+@autoresponse_group.command(name="show")
 @app_commands.autocomplete(rule=rule_id_autocomplete)
 async def autoresponse_show(interaction: discord.Interaction, rule: int):
+	"""Show the conditions and actions of an autoresponse.
+	
+	:param rule: Which autoresponse (start typing its name to search)
+	"""
 	existing = db.get_rule(rule, interaction.guild_id)
 	assert existing, "That autoresponse doesn't exist in this server."
 	rule_id, name, enabled, priority, conditions, actions, cooldown = existing
@@ -850,6 +1022,218 @@ async def autoresponse_show(interaction: discord.Interaction, rule: int):
 	embed.add_field(name="Actions", value=f"```json\n{actions[:1000]}\n```", inline=False)
 	embed.set_footer(text=f"#{rule_id} - {'on' if enabled else 'off'} - priority {priority} - cooldown {cooldown}s")
 	await interaction.response.send_message(embed=embed, ephemeral=True)
+
+####### ========================== reaction roles ========================== #######
+
+class ReactionRolesGroup(app_commands.Group):
+	async def interaction_check(self, interaction: discord.Interaction) -> bool:
+		if not isinstance(interaction.user, discord.Member) or interaction.guild is None:
+			await interaction.response.send_message("Only the server owner or an administrator can use this.", ephemeral=True)
+			return False
+		is_owner = interaction.user.id == interaction.guild.owner_id
+		is_admin = interaction.user.guild_permissions.administrator
+		if not (is_owner or is_admin):
+			await interaction.response.send_message("Only the server owner or an administrator can use this.", ephemeral=True)
+			return False
+		return True
+
+reactionroles_group = ReactionRolesGroup(
+	name="reactionroles", description="Manage this server's role panels (admin only)",
+	allowed_installs=app_commands.AppInstallationType(guild=True, user=False),
+	allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False),
+	default_permissions=discord.Permissions(administrator=True),
+)
+bot.tree.add_command(reactionroles_group)
+
+async def panel_id_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+	if interaction.guild_id is None:
+		return []
+	choices = []
+	for row in db.guild_panels(interaction.guild_id):
+		panel = reactionroles.panel_dict(row)
+		label = f"#{panel['id']} - {panel['title']}"
+		if current.lower() in label.lower():
+			choices.append(app_commands.Choice(name=label[:100], value=panel["id"]))
+	return choices[:25]
+
+@reactionroles_group.command(name="create", description="Start a new role panel")
+@app_commands.choices(
+	style=[app_commands.Choice(name="Reactions", value="reaction"), app_commands.Choice(name="Buttons", value="button"), app_commands.Choice(name="Dropdown", value="select")],
+	mode=[app_commands.Choice(name="No limit", value="multiple"), app_commands.Choice(name="Only one", value="single"), app_commands.Choice(name="Limited to", value="limited")],
+)
+async def reactionroles_create(
+	interaction: discord.Interaction, title: app_commands.Range[str, 1, reactionroles.MAX_TITLE],
+	channel: discord.TextChannel | None = None,
+	message: str | None = None,
+	style: app_commands.Choice[str] | None = None,
+	mode: app_commands.Choice[str] | None = None,
+	limit: app_commands.Range[int, 1, 24] | None = None,
+	description: app_commands.Range[str, 1, reactionroles.MAX_CONTENT] | None = None,
+	per_row: app_commands.Range[int, 1, reactionroles.MAX_PER_ROW] | None = None,
+):
+	"""Create a new role panel.
+	
+	:param title: The heading shown on the panel
+	:param channel: Where to post it (leave empty to use an existing message)
+	:param message: Link or ID of a message to put reactions on instead
+	:param style: How people pick their roles
+	:param mode: How many roles someone can have
+	:param limit: How many roles, when the mode is limited
+	:param description: Text shown under the title
+	:param per_row: How many buttons sit on each row (button panels, defaults to 4)
+	"""
+	assert db.module_enabled(interaction.guild_id, "reaction-roles"), "Reaction roles are turned off in this server."
+	assert db.count_panels(interaction.guild_id) < reactionroles.MAX_PANELS, f"This server already has {reactionroles.MAX_PANELS} panels, delete one first."
+
+	style_value = style.value if style else "reaction"
+	mode_value = mode.value if mode else "multiple"
+	assert mode_value != "limited" or limit, "Pick a limit when the mode is limited."
+
+	existing = None
+	if message:
+		assert channel is None, "Pick a channel or an existing message, not both."
+		existing = await find_message(interaction, message)
+		style_value = "reaction"  # only reactions can be added to a message we didn't send
+
+	target = existing.channel if existing else (channel or interaction.channel)
+	assert target is not None, "I can't work out where to put this. Try picking a channel."
+	permissions = target.permissions_for(interaction.guild.me)
+	assert permissions.send_messages and permissions.add_reactions, f"I can't post or react in {target.mention}."
+
+	panel_id = db.create_panel(
+		interaction.guild_id, target.id, title, style_value, mode_value,
+		limit_count=limit or 0, content=description or "",
+		owned=existing is None, message_id=existing.id if existing else None,
+		per_row=per_row or 0,
+	)
+
+	lines = [f"### {theme.SUC} Panel #{panel_id}", f"**{title}**"]
+	lines.append(f"**Where:** {existing.jump_url if existing else target.mention}")
+	lines.append(f"**Style:** {style_value}")
+	lines.append(f"**Picks:** {reactionroles.mode_line({'mode': mode_value, 'limit': limit or 0})}")
+	lines.append(f"\nAdd roles with `/reactionroles addrole panel:#{panel_id}`, or set it up on the website.")
+	await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+async def find_message(interaction: discord.Interaction, raw: str) -> discord.Message:
+	"""A message from a jump link or a bare ID, somewhere in this server."""
+	raw = raw.strip()
+	link = re.search(r"/channels/(\d+)/(\d+)/(\d+)", raw)
+	if link:
+		guild_id, channel_id, message_id = (int(part) for part in link.groups())
+		assert guild_id == interaction.guild_id, "That message is in another server."
+	else:
+		assert raw.isdigit(), "That doesn't look like a message link or ID."
+		channel_id, message_id = interaction.channel_id, int(raw)
+
+	channel = interaction.guild.get_channel_or_thread(channel_id)
+	assert channel is not None, "I can't see the channel that message is in."
+	try:
+		found = await channel.fetch_message(message_id)
+	except (discord.NotFound, discord.Forbidden) as error:
+		raise AssertionError("I can't find that message.") from error
+	assert db.panel_by_message(found.id) is None, "That message already has a panel on it."
+	return found
+
+@reactionroles_group.command(name="addrole")
+@app_commands.autocomplete(panel=panel_id_autocomplete)
+async def reactionroles_addrole(interaction: discord.Interaction, panel: int, role: discord.Role, emoji: str | None = None, label: app_commands.Range[str, 1, reactionroles.MAX_LABEL] | None = None):
+	"""Add a role to a panel.
+	
+	:param panel: Which panel to add it to
+	:param role: The role to hand out
+	:param emoji: The emoji people react with (for reaction panels)
+	:param label: What the button or dropdown row says (for button or dropdown panels)
+	"""
+	found = reactionroles.get_panel(panel, interaction.guild_id)
+	assert found, "That panel doesn't exist in this server."
+	cap = found["per_row"] * reactionroles.ROWS if found["style"] == "button" else reactionroles.MAX_OPTIONS
+	assert len(reactionroles.options_of(panel)) < cap, f"A {found['style']} panel like this one fits {cap} roles."
+	assert reactionroles.assignable(interaction.guild, role.id), f"I can't hand out {role.mention}. It's either above me in the role list or managed by an integration."
+
+	if found["style"] == "reaction":
+		assert emoji, "A reaction panel needs an emoji for every role."
+	elif found["style"] == "select":
+		assert label, "A dropdown panel needs a label for every role."
+	else:
+		assert emoji or label, "A button panel needs a label or an emoji for every role."
+
+	if emoji:
+		assert reactionroles.usable_emoji(emoji), "That doesn't look like an emoji I can use."
+		taken = {reactionroles.emoji_key(option["emoji"]) for option in reactionroles.options_of(panel)}
+		assert reactionroles.emoji_key(emoji) not in taken, "Another role on this panel already uses that emoji."
+
+	added = db.add_panel_option(panel, role.id, emoji, label or role.name)
+	assert added, f"{role.mention} is already on that panel."
+
+	await interaction.response.defer(ephemeral=True)
+	await reactionroles.refresh_panel(bot, panel)
+	await interaction.followup.send(f"{theme.SUC} Added {role.mention} to **{found['title']}**.", ephemeral=True)
+
+@reactionroles_group.command(name="removerole")
+@app_commands.autocomplete(panel=panel_id_autocomplete)
+async def reactionroles_removerole(interaction: discord.Interaction, panel: int, role: discord.Role):
+	"""Take a role off a panel.
+	
+	:param panel: Which panel to remove it from
+	:param role: The role to take off
+	"""
+	found = reactionroles.get_panel(panel, interaction.guild_id)
+	assert found, "That panel doesn't exist in this server."
+	assert db.remove_panel_option(panel, role.id), f"{role.mention} isn't on that panel."
+
+	await interaction.response.defer(ephemeral=True)
+	await reactionroles.refresh_panel(bot, panel)
+	await interaction.followup.send(f"{theme.SUC} Took {role.mention} off **{found['title']}**.", ephemeral=True)
+
+@reactionroles_group.command(name="post")
+@app_commands.autocomplete(panel=panel_id_autocomplete)
+async def reactionroles_post(interaction: discord.Interaction, panel: int):
+	"""Post or refresh a panel's message
+
+	:param panel: Which panel to post/update
+	"""
+	found = reactionroles.get_panel(panel, interaction.guild_id)
+	assert found, "That panel doesn't exist in this server."
+	assert reactionroles.options_of(panel), "Put at least one role on the panel first."
+
+	await interaction.response.defer(ephemeral=True)
+	# someone else's message is only ever given reactions, never rewritten
+	assert found["owned"], "That panel is on a message I didn't send, so I can't post it."
+	message = await reactionroles.post_panel(bot, found)
+	assert message, "I couldn't post there. Check I can still see the channel."
+	await interaction.followup.send(f"{theme.SUC} [Panel posted.]({message.jump_url})", ephemeral=True)
+
+@reactionroles_group.command(name="list")
+async def reactionroles_list(interaction: discord.Interaction):
+	"""List all the role panels in this server."""
+	rows = db.guild_panels(interaction.guild_id)
+	if not rows:
+		await interaction.response.send_message("No role panels set up yet.", ephemeral=True)
+		return
+
+	lines = []
+	for row in rows:
+		panel = reactionroles.panel_dict(row)
+		count = len(reactionroles.options_of(panel["id"]))
+		where = jump_url(panel["guild_id"], panel["channel_id"], panel["message_id"]) if panel["message_id"] else None
+		title = f"[{panel['title']}]({where})" if where else panel["title"]
+		lines.append(f"`#{panel['id']}` **{title}** - {panel['style']}, {count} role{'s' if count != 1 else ''}")
+
+	embed = discord.Embed(title="Role panels", description="\n".join(lines)[:4000], color=theme.COLOR_MAIN)
+	await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@reactionroles_group.command(name="delete")
+@app_commands.autocomplete(panel=panel_id_autocomplete)
+async def reactionroles_delete(interaction: discord.Interaction, panel: int):
+	"""Delete a role panel.
+
+	:param panel: Which panel to delete
+	"""
+	found = reactionroles.get_panel(panel, interaction.guild_id)
+	assert found, "That panel doesn't exist in this server."
+	await interaction.response.defer(ephemeral=True)
+	await reactionroles.delete_panel(bot, panel, interaction.guild_id)
+	await interaction.followup.send(f"{theme.SUC} Deleted **{found['title']}**.", ephemeral=True)
 
 ####### =================================================================== #######
 

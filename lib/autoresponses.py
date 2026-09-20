@@ -15,9 +15,6 @@ import discord
 
 from lib import database as db
 
-# Discord resolves a link into an embed after the message is posted, so a rule that
-# asks about embeds can't be answered yet. We wait for the edit that adds them
-# rather than sleeping a fixed amount, and give up after this long.
 EMBED_WAIT = 4.0
 
 MAX_ACTIONS = 10

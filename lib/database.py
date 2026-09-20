@@ -90,6 +90,41 @@ MIGRATIONS = [
 			created_at TEXT NOT NULL
 		)""",
 		"CREATE INDEX IF NOT EXISTS idx_autoresponses_guild ON AutoResponses(guild_id, priority, rule_id)",
+	], [
+		"""CREATE TABLE IF NOT EXISTS RolePanels (
+			panel_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			guild_id INTEGER NOT NULL,
+			channel_id INTEGER NOT NULL,
+			message_id INTEGER,
+			owned INTEGER NOT NULL DEFAULT 1,
+			title TEXT NOT NULL,
+			content TEXT NOT NULL DEFAULT '',
+			embed TEXT,
+			style TEXT NOT NULL DEFAULT 'reaction',
+			mode TEXT NOT NULL DEFAULT 'multiple',
+			limit_count INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		)""",
+		"""CREATE TABLE IF NOT EXISTS RolePanelOptions (
+			panel_id INTEGER NOT NULL,
+			role_id INTEGER NOT NULL,
+			emoji TEXT,
+			label TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			position INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (panel_id, role_id)
+		)""",
+		"CREATE INDEX IF NOT EXISTS idx_rolepanels_guild ON RolePanels(guild_id, panel_id DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_rolepanels_message ON RolePanels(message_id)",
+		"CREATE INDEX IF NOT EXISTS idx_rolepaneloptions ON RolePanelOptions(panel_id, position)",
+	], [
+		"ALTER TABLE RolePanels ADD COLUMN per_row INTEGER NOT NULL DEFAULT 0",
+	], [
+		"""CREATE TABLE IF NOT EXISTS UserSettings (
+			user_id INTEGER PRIMARY KEY,
+			timezone TEXT NOT NULL DEFAULT '',
+			tz_manual INTEGER NOT NULL DEFAULT 0
+		)""",
 	],
 ]
 
@@ -441,3 +476,122 @@ def count_rules(guild_id: int) -> int:
 	cur.execute("SELECT COUNT(*) FROM AutoResponses WHERE guild_id = ?", (guild_id,))
 	total, = cur.fetchone()
 	return total
+
+####### =========================== reaction roles ========================= #######
+
+def create_panel(guild_id: int, channel_id: int, title: str, style: str, mode: str, limit_count: int = 0, content: str = "", embed: str | None = None, owned: bool = True, message_id: int | None = None, per_row: int = 0) -> int:
+	cur.execute(
+		"INSERT INTO RolePanels (guild_id, channel_id, message_id, owned, title, content, embed, style, mode, limit_count, per_row, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		(guild_id, channel_id, message_id, int(owned), title, content, embed, style, mode, limit_count, per_row, datetime.now(timezone.utc).isoformat()),
+	)
+	conn.commit()
+	return cur.lastrowid
+
+def set_panel_message(panel_id: int, message_id: int):
+	cur.execute("UPDATE RolePanels SET message_id = ? WHERE panel_id = ?", (message_id, panel_id))
+	conn.commit()
+
+def get_panel(panel_id: int, guild_id: int | None = None):
+	"""Scoped to the guild, so a panel id from elsewhere can't be read through it."""
+	if guild_id is None:
+		cur.execute("SELECT panel_id, guild_id, channel_id, message_id, owned, title, content, embed, style, mode, limit_count, per_row FROM RolePanels WHERE panel_id = ?", (panel_id,))
+	else:
+		cur.execute("SELECT panel_id, guild_id, channel_id, message_id, owned, title, content, embed, style, mode, limit_count, per_row FROM RolePanels WHERE panel_id = ? AND guild_id = ?", (panel_id, guild_id))
+	return cur.fetchone()
+
+def panel_by_message(message_id: int):
+	cur.execute("SELECT panel_id, guild_id, channel_id, message_id, owned, title, content, embed, style, mode, limit_count, per_row FROM RolePanels WHERE message_id = ?", (message_id,))
+	return cur.fetchone()
+
+def guild_panels(guild_id: int) -> list[tuple]:
+	cur.execute("SELECT panel_id, guild_id, channel_id, message_id, owned, title, content, embed, style, mode, limit_count, per_row FROM RolePanels WHERE guild_id = ? ORDER BY panel_id DESC", (guild_id,))
+	return cur.fetchall()
+
+def count_panels(guild_id: int) -> int:
+	cur.execute("SELECT COUNT(*) FROM RolePanels WHERE guild_id = ?", (guild_id,))
+	total, = cur.fetchone()
+	return total
+
+def update_panel(panel_id: int, guild_id: int, **fields):
+	allowed = {"title", "content", "embed", "style", "mode", "limit_count", "channel_id", "message_id", "per_row"}
+	changes = {key: value for key, value in fields.items() if key in allowed}
+	if not changes:
+		return
+	assignments = ", ".join(f"{key} = ?" for key in changes)
+	cur.execute(
+		f"UPDATE RolePanels SET {assignments} WHERE panel_id = ? AND guild_id = ?",  # noqa: S608
+		(*changes.values(), panel_id, guild_id),
+	)
+	conn.commit()
+
+####### =========================== user settings ========================= #######
+
+def get_timezone(user_id: int) -> str:
+	"""Their IANA zone, or '' when they've never had one set."""
+	cur.execute("SELECT timezone FROM UserSettings WHERE user_id = ?", (user_id,))
+	row = cur.fetchone()
+	return row[0] if row else ""
+
+def timezone_is_manual(user_id: int) -> bool:
+	cur.execute("SELECT tz_manual FROM UserSettings WHERE user_id = ?", (user_id,))
+	row = cur.fetchone()
+	return bool(row and row[0])
+
+def set_timezone(user_id: int, name: str, manual: bool) -> bool:
+	"""Stores a zone. An automatic one never replaces a hand-picked one."""
+	if not manual and timezone_is_manual(user_id):
+		return False
+	cur.execute(
+		"""INSERT INTO UserSettings (user_id, timezone, tz_manual) VALUES (?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET timezone = excluded.timezone, tz_manual = excluded.tz_manual""",
+		(user_id, name, int(manual)),
+	)
+	conn.commit()
+	return True
+
+####### =================================================================== #######
+
+def unowned_panels() -> list[tuple]:
+	"""Panels sitting on a message Bonfire didn't record as its own."""
+	cur.execute("SELECT panel_id, guild_id, channel_id, message_id FROM RolePanels WHERE owned = 0 AND message_id IS NOT NULL")
+	return cur.fetchall()
+
+def set_panel_owned(panel_id: int, owned: bool):
+	"""Kept out of update_panel, since who wrote the message isn't the website's to say."""
+	cur.execute("UPDATE RolePanels SET owned = ? WHERE panel_id = ?", (1 if owned else 0, panel_id))
+	conn.commit()
+
+def delete_panel(panel_id: int, guild_id: int) -> bool:
+	cur.execute("DELETE FROM RolePanelOptions WHERE panel_id = ?", (panel_id,))
+	cur.execute("DELETE FROM RolePanels WHERE panel_id = ? AND guild_id = ?", (panel_id, guild_id))
+	conn.commit()
+	return cur.rowcount > 0
+
+def panel_options(panel_id: int) -> list[tuple]:
+	cur.execute("SELECT role_id, emoji, label, description, position FROM RolePanelOptions WHERE panel_id = ? ORDER BY position, role_id", (panel_id,))
+	return cur.fetchall()
+
+def set_panel_options(panel_id: int, options: list[tuple]):
+	"""Replaces a panel's roles wholesale, which is how the website saves them."""
+	cur.execute("DELETE FROM RolePanelOptions WHERE panel_id = ?", (panel_id,))
+	cur.executemany(
+		"INSERT INTO RolePanelOptions (panel_id, role_id, emoji, label, description, position) VALUES (?, ?, ?, ?, ?, ?)",
+		[(panel_id, role_id, emoji, label, description, position) for position, (role_id, emoji, label, description) in enumerate(options)],
+	)
+	conn.commit()
+
+def add_panel_option(panel_id: int, role_id: int, emoji: str | None, label: str = "", description: str = "") -> bool:
+	"""Puts a role at the end of a panel. False if it's already on it."""
+	cur.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM RolePanelOptions WHERE panel_id = ?", (panel_id,))
+	position, = cur.fetchone()
+	cur.execute(
+		"INSERT OR IGNORE INTO RolePanelOptions (panel_id, role_id, emoji, label, description, position) VALUES (?, ?, ?, ?, ?, ?)",
+		(panel_id, role_id, emoji, label, description, position),
+	)
+	conn.commit()
+	return cur.rowcount > 0
+
+def remove_panel_option(panel_id: int, role_id: int) -> bool:
+	cur.execute("DELETE FROM RolePanelOptions WHERE panel_id = ? AND role_id = ?", (panel_id, role_id))
+	conn.commit()
+	return cur.rowcount > 0
