@@ -1,6 +1,7 @@
 import hmac
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
@@ -205,9 +206,17 @@ class FieldError(ValueError):
 		super().__init__(message)
 		self.field = field
 
-def _reminder_target(bot, body: dict, user_id: int):
+async def _reminder_target(bot, body: dict, user_id: int):
 	"""Where a reminder should be sent, checking the user may actually post there.
 	Returns (channel_id, guild_id) or raises."""
+	if body.get("dm"):
+		user = bot.get_user(user_id)
+		if user is None:
+			raise web.HTTPBadRequest(text=json.dumps({"detail": "I can't find your account.", "field": "channel_id"}), content_type="application/json")
+		channel = await user.create_dm()
+		# no guild means deliver() sends it straight to the DM
+		return channel.id, None
+
 	channel_id = body.get("channel_id")
 	if not channel_id:
 		raise web.HTTPBadRequest(text=json.dumps({"detail": "Pick a channel for the reminder.", "field": "channel_id"}), content_type="application/json")
@@ -254,15 +263,62 @@ def _reminder_fields(body: dict):
 		raise FieldError("repeat", "That isn't a repeat option we know.")
 	return message, remind_at, repeat, pre_offsets
 
+MENTION_PATTERN = re.compile(r"<(@[!&]?|#)(\d+)>")
+JUMP_PATTERN = re.compile(r"discord(?:app)?\.com/channels/(?:\d+|@me)/(\d+)")
+
+CHANNEL_KINDS = (
+	(discord.ForumChannel, "forum"),
+	(discord.VoiceChannel, "voice"),
+	(discord.StageChannel, "stage"),
+	(discord.CategoryChannel, "category"),
+	(discord.Thread, "thread"),
+)
+
+def _channel_entry(channel) -> dict | None:
+	"""A channel mention, with what it takes to draw it the way Discord does."""
+	if channel is None or not hasattr(channel, "name"):
+		return None
+	kind = next((label for cls, label in CHANNEL_KINDS if isinstance(channel, cls)), "channel")
+	entry = {"name": channel.name, "kind": kind}
+	# the guild is only worth naming when the link points out of the one being read
+	guild = getattr(channel, "guild", None)
+	if guild is not None:
+		entry["guild"] = guild.name
+		if guild.icon:
+			entry["icon"] = guild.icon.replace(size=32, static_format="webp").url
+	return entry
+
+def _mention_names(bot, text: str) -> dict:
+	"""Names for the mentions in a reminder, so the website can show them instead
+	of a bare @ or #."""
+	names = {}
+	# a message link carries a channel id too, so it can be shown by name
+	for raw in JUMP_PATTERN.findall(text or ""):
+		names[raw] = _channel_entry(bot.get_channel(int(raw)))
+	for kind, raw in MENTION_PATTERN.findall(text or ""):
+		target_id = int(raw)
+		if kind == "#":
+			names[raw] = _channel_entry(bot.get_channel(target_id))
+		elif kind == "@&":
+			role = next((g.get_role(target_id) for g in bot.guilds if g.get_role(target_id)), None)
+			names[raw] = {"name": role.name, "kind": "role"} if role else None
+		else:
+			user = bot.get_user(target_id)
+			names[raw] = {"name": user.display_name, "kind": "user"} if user else None
+	return {raw: entry for raw, entry in names.items() if entry}
+
 async def get_reminders(request: web.Request):
 	if not _authorised(request):
 		raise web.HTTPUnauthorized()
 	user_id = int(request.match_info["user_id"])
+	bot = request.app["bot"]
 	rows = [
 		{
 			"id": reminder_id, "message": message, "remind_at": remind_at,
 			"repeat": repeat, "pre_offsets": pre_offsets,
 			"channel_id": str(channel_id), "guild_id": str(guild_id) if guild_id else None,
+			"dm": guild_id is None,
+			"mentions": _mention_names(bot, message),
 		}
 		for reminder_id, message, remind_at, repeat, pre_offsets, channel_id, guild_id in db.list_reminders(user_id)
 	]
@@ -284,7 +340,7 @@ async def save_reminder(request: web.Request):
 			text=json.dumps({"detail": str(error), "field": getattr(error, "field", None)}),
 			content_type="application/json",
 		) from error
-	channel_id, guild_id = _reminder_target(request.app["bot"], body, user_id)
+	channel_id, guild_id = await _reminder_target(request.app["bot"], body, user_id)
 
 	reminder_id = body.get("id")
 	if reminder_id is None:

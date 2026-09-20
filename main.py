@@ -602,6 +602,7 @@ async def reminder_add(
 	interaction: discord.Interaction, when: str,
 	message: app_commands.Range[str, 1, reminders.MAX_MESSAGE_LENGTH],
 	channel: discord.TextChannel | discord.VoiceChannel | discord.StageChannel | discord.Thread | None = None,
+	dm: bool | None = None,
 	repeat: app_commands.Choice[str] | None = None,
 	pre_reminders: str | None = None,
 ):
@@ -610,10 +611,19 @@ async def reminder_add(
 	:param when: A duration (`10m`, `1h30m`, `1w2d`), a date (`2026-10-16 17:30`), or a timestamp
 	:param message: What to remind you about
 	:param channel: Where to send it (defaults to here or DMs)
+	:param dm: Send it to your DMs instead of a channel
 	:param repeat: Whether it should repeat (daily, weekly, monthly, yearly)
 	:param pre_reminders: List of reminders about the upcoming reminder separated by commas, like `1d, 1h`
 	"""
-	target = channel or interaction.channel
+	assert not (dm and channel is not None), "Pick a channel or your DMs, not both."
+	# Discord has no way to hide a parameter per context, so it's rejected instead
+	assert not (channel is not None and interaction.guild is None), "Picking a channel only works inside a server."
+
+	if dm:
+		# a DM reminder carries no guild, which is what deliver() treats as DM-only
+		target = await interaction.user.create_dm()
+	else:
+		target = channel or interaction.channel
 	assert target is not None, "I can't work out where to send this. Try picking a channel."
 
 	if channel is not None:
@@ -638,11 +648,14 @@ async def reminder_add(
 	assert count < reminders.MAX_PER_USER, f"You already have {reminders.MAX_PER_USER} reminders, delete one first."
 
 	repeat_value = repeat.value if repeat else "none"
-	_ = db.create_reminder(interaction.user.id, target.id, interaction.guild_id, message, remind_at.isoformat(), repeat_value, pre_offsets)
+	guild_id = None if dm else interaction.guild_id
+	_ = db.create_reminder(interaction.user.id, target.id, guild_id, message, remind_at.isoformat(), repeat_value, pre_offsets)
 
 	lines = [f"### {theme.SUC} Reminder", message,
 		f"\n**When:** <t:{int(remind_at.timestamp())}:F> (<t:{int(remind_at.timestamp())}:R>)"]
-	if channel is not None:
+	if dm:
+		lines.append("**Where:** your DMs")
+	elif channel is not None:
 		lines.append(f"**Where:** {target.mention}")
 	if repeat_value != "none":
 		lines.append(f"**Repeats:** {repeat_value}")
