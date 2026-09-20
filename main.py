@@ -699,11 +699,11 @@ vs_group = app_commands.Group(
 bot.tree.add_command(vs_group)
 
 async def start_game(interaction: discord.Interaction, key: str, title: str, build, opponent: discord.User | None):
-	"""Posts a challenge. A named opponent has to accept it; with none, anyone can take it."""
+	"""Posts a challenge. The opponent has to accept, if no opponent is specified then anyone can."""
 	assert db.module_enabled(interaction.guild_id, f"games:{key}"), f"{title} is turned off in this server."
 	assert opponent is None or not opponent.bot, "You can't play against a bot!"
 	assert opponent is None or opponent.id != interaction.user.id, "You can't play against yourself!"
-	assert not games.busy(interaction.user), "You're already in a game!."
+	assert not games.busy(interaction.user), "You're already in a game!"
 	assert not games.busy(opponent), f"{opponent.display_name} is already in a game!" if opponent else ""
 
 	challenge = games.ChallengeView(interaction.user, opponent, title, build)
@@ -790,7 +790,11 @@ async def autoresponse_list(interaction: discord.Interaction):
 	lines = []
 	for rule_id, name, enabled, priority, conditions, actions, cooldown in rules:
 		try:
-			kinds = [step.get("type", "?") for step in json.loads(actions)]
+			branches = autoresponses.split_actions(json.loads(actions))
+			kinds = [step.get("type", "?") for step in branches["actions"]]
+			for branch in branches["elifs"]:
+				kinds += [f"else if {step.get('type', '?')}" for step in branch.get("actions") or []]
+			kinds += [f"else {step.get('type', '?')}" for step in branches["otherwise"]]
 		except json.JSONDecodeError:
 			kinds = ["(unreadable)"]
 		state = "on" if enabled else "off"

@@ -99,8 +99,16 @@ async def get_choices(request: web.Request):
 			channels.append({"id": str(category.id), "name": category.name, "kind": "category", "parent": None})
 		channels.extend(inside)
 
+	# the bot can only hand out roles below its own top one, and never a managed one
+	can_manage = guild.me is not None and guild.me.guild_permissions.manage_roles
+	top = guild.me.top_role if can_manage else None
 	roles = [
-		{"id": str(role.id), "name": role.name, "colour": f"#{role.colour.value:06X}" if role.colour.value else None}
+		{
+			"id": str(role.id),
+			"name": role.name,
+			"colour": f"#{role.colour.value:06X}" if role.colour.value else None,
+			"assignable": bool(top and role < top and not role.managed),
+		}
 		for role in reversed(guild.roles) if not role.is_default()
 	]
 	return web.json_response({"channels": channels, "roles": roles})
@@ -112,7 +120,9 @@ async def get_rules(request: web.Request):
 	rules = [
 		{
 			"id": rule_id, "name": name, "enabled": bool(enabled), "priority": priority,
-			"conditions": json.loads(conditions), "actions": json.loads(actions), "cooldown": cooldown,
+			"conditions": json.loads(conditions), "cooldown": cooldown,
+			"threads": autoresponses.thread_mode(json.loads(conditions)),
+			**autoresponses.split_actions(json.loads(actions)),
 		}
 		for rule_id, name, enabled, priority, conditions, actions, cooldown in db.guild_rules(guild_id, only_enabled=False)
 	]
@@ -139,9 +149,11 @@ async def save_rule(request: web.Request):
 		if db.count_rules(guild_id) >= autoresponses.MAX_RULES:
 			raise web.HTTPBadRequest(text=f"A server can have at most {autoresponses.MAX_RULES} autoresponses.")
 		rule_id = db.create_rule(
-			guild_id, fields["name"], json.dumps(fields["conditions"]), json.dumps(fields["actions"]),
+			guild_id, fields["name"], json.dumps(fields["conditions"]),
+			json.dumps(autoresponses.pack_actions(fields["actions"], fields["otherwise"], fields["elifs"])),
 			priority=fields["priority"], cooldown=fields["cooldown"],
 		)
+		autoresponses.forget_guild(guild_id)
 	else:
 		rule_id = int(rule_id)
 		if db.get_rule(rule_id, guild_id) is None:
@@ -149,9 +161,11 @@ async def save_rule(request: web.Request):
 		db.update_rule(
 			rule_id, guild_id,
 			name=fields["name"], conditions=json.dumps(fields["conditions"]),
-			actions=json.dumps(fields["actions"]), priority=fields["priority"],
+			actions=json.dumps(autoresponses.pack_actions(fields["actions"], fields["otherwise"], fields["elifs"])),
+			priority=fields["priority"],
 			cooldown=fields["cooldown"], enabled=int(fields["enabled"]),
 		)
+		autoresponses.forget_guild(guild_id)
 	return web.json_response({"id": rule_id})
 
 async def toggle_rule(request: web.Request):
@@ -166,6 +180,7 @@ async def toggle_rule(request: web.Request):
 
 	body = await request.json()
 	db.update_rule(rule_id, guild_id, enabled=int(bool(body.get("enabled"))))
+	autoresponses.forget_guild(guild_id)
 	return web.json_response({"id": rule_id, "enabled": bool(body.get("enabled"))})
 
 async def delete_rule(request: web.Request):
@@ -180,6 +195,7 @@ async def delete_rule(request: web.Request):
 
 	db.delete_rule(rule_id, guild_id)
 	autoresponses.forget_rule(rule_id)
+	autoresponses.forget_guild(guild_id)
 	return web.json_response({"deleted": rule_id})
 
 class FieldError(ValueError):
