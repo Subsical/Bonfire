@@ -368,6 +368,11 @@ def set_remind_at(reminder_id: int, remind_at: str):
 	cur.execute("UPDATE Reminders SET remind_at = ?, sent_offsets = '' WHERE reminder_id = ?", (remind_at, reminder_id))
 	conn.commit()
 
+def set_reminder_message(reminder_id: int, message: str):
+	"""Rewrites a repeating reminder's text, for the counters inside it."""
+	cur.execute("UPDATE Reminders SET message = ? WHERE reminder_id = ?", (message, reminder_id))
+	conn.commit()
+
 def set_sent_offsets(reminder_id: int, offsets: list[int]):
 	cur.execute("UPDATE Reminders SET sent_offsets = ? WHERE reminder_id = ?", (",".join(str(o) for o in offsets), reminder_id))
 	conn.commit()

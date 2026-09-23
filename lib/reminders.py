@@ -144,6 +144,82 @@ def catch_up(when: datetime, repeat: str) -> datetime | None:
 
 ####### =================================================================== #######
 
+# {{count:3}}, {{years:2018-08-29}}, {{user.ping}}
+VARIABLE_PATTERN = re.compile(r"\{\{ *([a-z]+)(?:[.:]([^{}]*?))? *\}\}")
+ELAPSED_UNITS = ("years", "months", "days")
+
+def _elapsed(kind: str, start: str, now: datetime) -> str | None:
+	"""How long since a date written into the message, or None if it isn't one."""
+	try:
+		since = datetime.fromisoformat(start.strip()).replace(tzinfo=timezone.utc)
+	except ValueError:
+		return None
+
+	months = (now.year - since.year) * 12 + now.month - since.month
+	# a month isn't up until the day comes round
+	if now.day < since.day:
+		months -= 1
+	if kind == "years":
+		return str(max(0, months // 12))
+	if kind == "months":
+		return str(max(0, months))
+	return str(max(0, (now - since).days))
+
+def _count_at(raw: str | None) -> int | None:
+	"""The number a counter stands at. A bare {{count}} is one, a bad one is None."""
+	value = (raw or "").strip()
+	if not value:
+		return 1
+	try:
+		return int(value)
+	except ValueError:
+		return None
+
+def _counters(text: str) -> bool:
+	"""Whether a message has a counter to rewrite, so only those get written back."""
+	return any(
+		match.group(1) == "count" and _count_at(match.group(2)) is not None
+		for match in VARIABLE_PATTERN.finditer(text or "")
+	)
+
+def advance(text: str) -> str:
+	"""The message with every counter moved on one, for the next time it repeats."""
+	def bump(match: re.Match) -> str:
+		current = _count_at(match.group(2))
+		if match.group(1) != "count" or current is None:
+			return match.group(0)
+		return f"{{{{count:{current + 1}}}}}"
+
+	moved = VARIABLE_PATTERN.sub(bump, text)
+	# rolling into another digit can push a message that was already at the limit over it
+	return text if len(moved) > MAX_MESSAGE_LENGTH else moved
+
+def fill(text: str, user_id: int | None = None) -> str:
+	"""A reminder's message with its variables filled in, as it gets sent."""
+	local = datetime.now(zone_of(user_id))
+	values = {
+		("date", ""): local.strftime("%Y-%m-%d"),
+		("time", ""): local.strftime("%H:%M"),
+		("year", ""): str(local.year),
+		("user", "ping"): f"<@{user_id}>" if user_id else "",
+		("user", "mention"): f"<@{user_id}>" if user_id else "",
+		("user", "id"): str(user_id) if user_id else "",
+	}
+
+	def swap(match: re.Match) -> str:
+		kind, name = match.group(1), (match.group(2) or "").strip()
+		if kind == "count":
+			current = _count_at(name)
+			return str(current) if current is not None else match.group(0)
+		if kind in ELAPSED_UNITS:
+			elapsed = _elapsed(kind, name, local)
+			return elapsed if elapsed is not None else match.group(0)
+		return values.get((kind, name), match.group(0))
+
+	return VARIABLE_PATTERN.sub(swap, text)
+
+####### =================================================================== #######
+
 def parse_offsets(raw: str) -> list[int]:
 	return [int(o) for o in raw.split(",") if o]
 
@@ -154,7 +230,7 @@ async def deliver(bot: discord.Client, reminder: tuple, pre_offset: int | None =
 
 	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
 	heading = "### ⏰ Coming up" if pre_offset is not None else "### 🔔 Reminder"
-	container.add_item(discord.ui.TextDisplay(f"{heading}\n<@{user_id}>\n{message}"))
+	container.add_item(discord.ui.TextDisplay(f"{heading}\n<@{user_id}>\n{fill(message, user_id)}"))
 
 	footer = [f"<t:{int(datetime.fromisoformat(remind_at).timestamp())}:R>"]
 	if pre_offset is not None:
@@ -209,11 +285,14 @@ async def check_due(bot: discord.Client):
 			db.set_sent_offsets(reminder_id, sent)
 
 	for reminder in db.due_reminders():
-		reminder_id, _, _, _, _, remind_at, repeat, _, _ = reminder
-		await deliver(bot, reminder)
+		reminder_id, _, _, _, message, remind_at, repeat, _, _ = reminder
+		sent = await deliver(bot, reminder)
 
 		following = catch_up(datetime.fromisoformat(remind_at), repeat) if repeat != "none" else None
 		if following is None:
 			db.delete_reminder(reminder_id)
 		else:
 			db.set_remind_at(reminder_id, following.isoformat())
+			# a number that was never delivered shouldn't be used up
+			if sent and _counters(message):
+				db.set_reminder_message(reminder_id, advance(message))

@@ -626,7 +626,7 @@ async def reminder_add(
 	"""Set a reminder for yourself.
 
 	:param when: A duration (`10m`, `1h30m`, `1w2d`), a date (`2026-10-16 17:30`), or a timestamp
-	:param message: What to remind you about
+	:param message: What to remind you about (supports variables, see `/reminder variables`)
 	:param channel: Where to send it (defaults to here or DMs)
 	:param dm: Send it to your DMs instead of a channel
 	:param repeat: Whether it should repeat (daily, weekly, monthly, yearly)
@@ -666,7 +666,7 @@ async def reminder_add(
 	guild_id = None if dm else interaction.guild_id
 	_ = db.create_reminder(interaction.user.id, target.id, guild_id, message, remind_at.isoformat(), repeat_value, pre_offsets)
 
-	lines = [f"### {theme.SUC} Reminder", message,
+	lines = [f"### {theme.SUC} Reminder", reminders.fill(message, interaction.user.id),
 		f"\n**When:** <t:{int(remind_at.timestamp())}:F> (<t:{int(remind_at.timestamp())}:R>)"]
 	if dm:
 		lines.append("**Where:** your DMs")
@@ -701,11 +701,41 @@ async def reminder_list(interaction: discord.Interaction):
 		if pre_raw:
 			extras.append(", ".join(reminders.format_duration(int(o)) for o in pre_raw.split(",") if o) + " early")
 		suffix = f" -# ({'; '.join(extras)})" if extras else ""
-		lines.append(f"**#{reminder_id}** <t:{stamp}:R> in <#{channel_id}>\n{message[:120]}{suffix}")
+		filled = reminders.fill(message, interaction.user.id)
+		lines.append(f"**#{reminder_id}** <t:{stamp}:R> in <#{channel_id}>\n{filled[:120]}{suffix}")
 
 	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
 	container.add_item(discord.ui.TextDisplay(f"### ⏰ Your reminders ({len(rows)})"))
 	container.add_item(discord.ui.TextDisplay("\n\n".join(lines)[:3900]))
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	await interaction.response.send_message(view=view, ephemeral=True)
+
+@reminder_group.command(name="variables")
+async def reminder_variables(interaction: discord.Interaction):
+	"""See the variables you can put in a reminder's message."""
+	lines = [
+		"### Reminder variables",
+		"Put these in a reminder's message and they get filled in when it's sent.",
+		"",
+		"**A number that counts up**",
+		"`{{count}}` goes up by one every time the reminder repeats, starting from 1. "
+		"`{{count:5}}` starts from 5 instead.",
+		"> Roblox removed Builders Club `{{count:7}}` years ago.",
+		"",
+		"**Time since a date**",
+		"`{{years:2018-08-29}}` is the whole years since that date, and `{{months:...}}` "
+		"and `{{days:...}}` work the same way. These are worked out fresh every time, so "
+		"they stay right even if a reminder gets missed.",
+		"> Roblox removed Builders Club `{{years:2018-08-29}}` years ago.",
+		"",
+		"**Everything else**",
+		"`{{date}}`, `{{time}}` and `{{year}}` are when it's sent, on your clock. "
+		"`{{user.mention}}` pings you and `{{user.id}}` is your ID.",
+	]
+
+	container = discord.ui.Container(accent_color=theme.COLOR_MAIN)
+	container.add_item(discord.ui.TextDisplay("\n".join(lines)))
 	view = discord.ui.LayoutView(timeout=None)
 	view.add_item(container)
 	await interaction.response.send_message(view=view, ephemeral=True)
@@ -790,7 +820,7 @@ async def reminder_edit(
 
 	:param reminder_id: See /reminder list to find the ID
 	:param when: A duration (`10m`, `1h30m`, `1w2d`), a date (`2026-10-16 17:30`), or a timestamp
-	:param message: What to remind you about
+	:param message: What to remind you about (supports variables, see `/reminder variables`)
 	:param channel: Where to send it
 	:param dm: Send it to your DMs instead of a channel
 	:param repeat: Whether it should repeat (daily, weekly, monthly, yearly)
@@ -843,7 +873,7 @@ async def reminder_edit(
 
 	row = db.get_reminder(reminder_id, interaction.user.id)
 	stamp = int(datetime.fromisoformat(row[5]).timestamp())
-	lines = [f"### {theme.SUC} Reminder #{reminder_id} updated", row[4],
+	lines = [f"### {theme.SUC} Reminder #{reminder_id} updated", reminders.fill(row[4], interaction.user.id),
 		f"\n**When:** <t:{stamp}:F> (<t:{stamp}:R>)",
 		f"**Where:** <#{row[2]}>"]
 	if row[6] != "none":
@@ -1249,24 +1279,20 @@ async def tend_roblox_friends():
 	"""Takes new friend requests, and drops anyone who stopped using the command."""
 	async with aiohttp.ClientSession(timeout=roblox.TIMEOUT) as session:
 		try:
-			# also settles who the helper account is, for the link in the privacy notice
 			await roblox.helper_id(session)
 			accepted = await roblox.accept_friend_requests(session)
 			friends = await roblox.friend_ids(session)
 		except roblox.RobloxError:
 			return
 
-		# friending us from the account they claimed is what proves it's theirs
 		for roblox_id in accepted:
 			db.touch_roblox_friend(roblox_id)
 			claim = _roblox_claims.pop(roblox_id, None)
 			if claim is None:
 				continue
 			user_id, display, origin = claim
-			# someone may have linked it in the time the claim was waiting
 			if not db.link_roblox_account(user_id, roblox_id, display):
 				continue
-			# the ephemeral message still says to send a request, so say it worked
 			try:
 				await origin.edit_original_response(view=roblox_linked_notice(display))
 			except discord.HTTPException:
@@ -1274,13 +1300,12 @@ async def tend_roblox_friends():
 
 		drop_stale_claims()
 
-		# a friend we never recorded still takes up a slot, so start their clock now
 		known = db.known_roblox_friends()
 		for roblox_id in friends:
 			if roblox_id not in known:
 				db.touch_roblox_friend(roblox_id)
 
-		# Roblox caps a friend list at 1000, so idle people make room for new ones
+		# roblox caps a friend list at 1000 so idle people make room for new ones
 		cutoff = (datetime.now(timezone.utc) - timedelta(days=FRIEND_IDLE_DAYS)).isoformat()
 		on_list = set(friends)
 		for roblox_id in db.stale_roblox_friends(cutoff):
