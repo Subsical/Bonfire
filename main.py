@@ -1305,7 +1305,7 @@ async def tend_roblox_friends():
 			if roblox_id not in known:
 				db.touch_roblox_friend(roblox_id)
 
-		# roblox caps a friend list at 1000 so idle people make room for new ones
+		# rzoblox caps a friend list at 1000 so idle people make room for new ones
 		cutoff = (datetime.now(timezone.utc) - timedelta(days=FRIEND_IDLE_DAYS)).isoformat()
 		on_list = set(friends)
 		for roblox_id in db.stale_roblox_friends(cutoff):
@@ -1559,6 +1559,132 @@ async def robloxaccount_unlink(interaction: discord.Interaction):
 			pass
 	db.forget_roblox_friend(linked[0])
 	await interaction.followup.send(f"{theme.SUC} Unlinked from **{linked[1]}**.", ephemeral=True)
+
+####### =================================================================== #######
+
+lookup_group = app_commands.Group(
+	name="lookup", description="Look up games, music, anime and more",
+	allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+	allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True),
+)
+bot.tree.add_command(lookup_group)
+
+def lookup_view(card: dict) -> discord.ui.LayoutView:
+	"""One layout for every /lookup result, whichever site it came from."""
+	container = discord.ui.Container(accent_color=card["color"] or theme.COLOR_MAIN)
+
+	subtitle = f"\n-# {card['subtitle']}" if card["subtitle"] else ""
+	# the icon's own right margin is the gap, a space on top of it looks too wide
+	icon = card["icon"] or ""
+	badge = f" {card['badge']}" if card["badge"] else ""
+	header = [discord.ui.TextDisplay(f"## {icon}[{card['title']}]({card['url']}){badge}{subtitle}")]
+	if card["description"]:
+		header.append(discord.ui.TextDisplay(card["description"]))
+	if card["thumbnail"]:
+		container.add_item(discord.ui.Section(*header, accessory=discord.ui.Thumbnail(card["thumbnail"])))
+	else:
+		for item in header:
+			container.add_item(item)
+
+	if card["facts"]:
+		container.add_item(discord.ui.Separator())
+		facts = discord.ui.TextDisplay("\n".join(card["facts"]))
+		if card["facts_thumbnail"]:
+			container.add_item(discord.ui.Section(facts, accessory=discord.ui.Thumbnail(card["facts_thumbnail"])))
+		else:
+			container.add_item(facts)
+	if card["extra"]:
+		container.add_item(discord.ui.Separator())
+		container.add_item(discord.ui.TextDisplay(card["extra"]))
+	if card["banner"]:
+		container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(card["banner"])))
+
+	row = discord.ui.ActionRow()
+	for label, url in card["links"]:
+		if url:
+			row.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.link, url=url))
+	if row.children:
+		container.add_item(row)
+	if card["source"]:
+		container.add_item(discord.ui.TextDisplay(f"-# > Source: {card['source']}"))
+
+	view = discord.ui.LayoutView(timeout=None)
+	view.add_item(container)
+	return view
+
+async def send_lookup(interaction: discord.Interaction, fetch):
+	"""Run a lookup and post its card, or why it couldn't be found."""
+	await interaction.response.defer()
+	async with lookup.session() as session:
+		try:
+			card = await fetch(session)
+		except (lookup.LookupFailed, roblox.RobloxError) as error:
+			await interaction.followup.send(f"{theme.ERR} {error}", ephemeral=True)
+			return
+	files = [discord.File(io.BytesIO(data), filename=name) for name, data in card["files"]]
+	await interaction.followup.send(view=lookup_view(card), files=files, allowed_mentions=discord.AllowedMentions.none())
+
+@lookup_group.command(name="roblox")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def lookup_roblox(interaction: discord.Interaction, username: app_commands.Range[str, 1, roblox.MAX_USERNAME_LENGTH]):
+	"""Look up a Roblox account.
+
+	:param username: Their Roblox username
+	"""
+	await send_lookup(interaction, lambda session: lookup.roblox_user(session, username))
+
+@lookup_group.command(name="music")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def lookup_music(
+	interaction: discord.Interaction,
+	song: app_commands.Range[str, 1, lookup.MAX_QUERY_LENGTH] | None = None,
+	album: app_commands.Range[str, 1, lookup.MAX_QUERY_LENGTH] | None = None,
+	artist: app_commands.Range[str, 1, lookup.MAX_QUERY_LENGTH] | None = None,
+):
+	"""Look up a song, album or artist.
+
+	:param song: The song's name
+	:param album: The album's name, or the album the song is on
+	:param artist: The artist's name, or who made the song or album
+	"""
+	assert song or album or artist, "Give a song, album or artist to look up."
+	await send_lookup(interaction, lambda session: lookup.music(session, song, album, artist))
+
+@lookup_group.command(name="game")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def lookup_game(interaction: discord.Interaction, name: app_commands.Range[str, 1, lookup.MAX_QUERY_LENGTH]):
+	"""Look up a Steam game, with player counts and review stats.
+
+	:param name: The game's name or Steam link
+	"""
+	await send_lookup(interaction, lambda session: lookup.game(session, name))
+
+@lookup_group.command(name="anime")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def lookup_anime(interaction: discord.Interaction, name: app_commands.Range[str, 1, lookup.MAX_QUERY_LENGTH]):
+	"""Look up an anime.
+
+	:param name: The anime's name, in English or Japanese
+	"""
+	await send_lookup(interaction, lambda session: lookup.media(session, name, "ANIME"))
+
+@lookup_group.command(name="manga")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def lookup_manga(interaction: discord.Interaction, name: app_commands.Range[str, 1, lookup.MAX_QUERY_LENGTH]):
+	"""Look up a manga or light novel.
+
+	:param name: The manga's name, in English or Japanese
+	"""
+	await send_lookup(interaction, lambda session: lookup.media(session, name, "MANGA"))
+
+@lookup_group.command(name="character")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+async def lookup_character(interaction: discord.Interaction, name: app_commands.Range[str, 1, lookup.MAX_QUERY_LENGTH]):
+	"""Look up a fictional character from anything, books to games to anime.
+
+	:param name: The character's name
+	"""
+	await send_lookup(interaction, lambda session: lookup.character(session, name))
 
 ####### =================================================================== #######
 

@@ -1,12 +1,16 @@
 import asyncio
 import os
 import re
+import time
 
 import aiohttp
 
 HOSTS = ("roblox.com", "roproxy.com")
 TIMEOUT = aiohttp.ClientTimeout(total=12, connect=5)
 MAX_USERNAME_LENGTH = 20
+MAX_HISTORY_PAGES = 3
+HISTORY_CACHE_SECONDS = 60 * 60
+HISTORY_CACHE_SIZE = 500
 
 OFFLINE, ONLINE, IN_GAME, IN_STUDIO = 0, 1, 2, 3
 JOB_ID = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
@@ -129,6 +133,81 @@ async def presence(session: aiohttp.ClientSession, roblox_id: int) -> dict:
 	if not rows:
 		raise RobloxError("Roblox wouldn't tell me where they are.")
 	return rows[0]
+
+async def profile(session: aiohttp.ClientSession, roblox_id: int) -> dict:
+	"""Everything public about an account, for /lookup roblox."""
+	async def optional(request):
+		try:
+			return await request
+		except RobloxError:
+			return None
+
+	user, friends, followers, following, avatar, headshot, history, where = await asyncio.gather(
+		_get(session, "users", f"/v1/users/{roblox_id}"),
+		optional(_get(session, "friends", f"/v1/users/{roblox_id}/friends/count")),
+		optional(_get(session, "friends", f"/v1/users/{roblox_id}/followers/count")),
+		optional(_get(session, "friends", f"/v1/users/{roblox_id}/followings/count")),
+		optional(_get(
+			session, "thumbnails", "/v1/users/avatar",
+			userIds=roblox_id, size="420x420", format="Png", isCircular="false",
+		)),
+		optional(_get(
+			session, "thumbnails", "/v1/users/avatar-headshot",
+			userIds=roblox_id, size="420x420", format="Png", isCircular="false",
+		)),
+		past_usernames(session, roblox_id),
+		optional(presence(session, roblox_id)),
+	)
+	def image(response: dict | None) -> str | None:
+		rows = (response or {}).get("data") or []
+		return rows[0].get("imageUrl") if rows and rows[0].get("state") == "Completed" else None
+
+	return {
+		**user,
+		"friends": (friends or {}).get("count"),
+		"followers": (followers or {}).get("count"),
+		"following": (following or {}).get("count"),
+		"avatar": image(avatar),
+		"headshot": image(headshot),
+		"past_names": history,
+		"presence": (where or {}).get("userPresenceType"),
+		"location": (where or {}).get("lastLocation"),
+	}
+
+# roblox id -> (when it goes stale, names), since roblox only answers one history request a minute
+_history_cache: dict[int, tuple[float, list[str]]] = {}
+
+async def past_usernames(session: aiohttp.ClientSession, roblox_id: int) -> list[str]:
+	"""Every name the account has had, newest first."""
+	cached = _history_cache.get(roblox_id)
+	if cached and cached[0] > time.monotonic():
+		return cached[1]
+
+	names, cursor, complete = [], None, False
+	for _ in range(MAX_HISTORY_PAGES):
+		params = {"limit": 100, "sortOrder": "Desc"}
+		if cursor:
+			params["cursor"] = cursor
+		try:
+			data = await _get(session, "users", f"/v1/users/{roblox_id}/username-history", **params)
+		except RobloxError:
+			break
+		names += [row["name"] for row in data.get("data") or [] if row.get("name")]
+		cursor = data.get("nextPageCursor")
+		if not cursor:
+			complete = True
+			break
+
+	# a list cut short by the limit shouldn't stop the next lookup from trying again
+	if complete:
+		_history_cache.pop(roblox_id, None)
+		_history_cache[roblox_id] = (time.monotonic() + HISTORY_CACHE_SECONDS, names)
+		if len(_history_cache) > HISTORY_CACHE_SIZE:
+			del _history_cache[next(iter(_history_cache))]
+	return names
+
+def profile_url(roblox_id: int) -> str:
+	return f"https://www.roblox.com/users/{roblox_id}/profile"
 
 async def servers(session: aiohttp.ClientSession, place_id: int, limit: int = 10) -> list[dict]:
 	"""Get public servers for a place, sorted by player count."""
