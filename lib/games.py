@@ -1,5 +1,6 @@
 import discord
 
+from lib import database as db
 from lib import theme
 
 TIMEOUT = 5*60
@@ -204,6 +205,7 @@ def shot_result(fleet: list[list[int]], shots: set[int], square: int) -> str:
 
 class GameView(discord.ui.LayoutView):
 	"""Shared functions: who's playing, whose turn it is, and who's allowed to press what."""
+	GAME = ""
 
 	def __init__(self, challenger: discord.User, opponent: discord.User | None):
 		super().__init__(timeout=TIMEOUT)
@@ -213,6 +215,7 @@ class GameView(discord.ui.LayoutView):
 		self.forfeited_by: int | None = None
 		self.expired = False
 		self.restarted = False
+		self.record: tuple[int, int, int] | None = None
 		self.message: discord.Message | None = None
 		for player in self.players:
 			if player is not None:
@@ -267,6 +270,22 @@ class GameView(discord.ui.LayoutView):
 			if player is not None:
 				PLAYING.discard(player.id)
 
+	def settle(self, winner: int | None):
+		"""Adds the result to the pair's record, once. None is a draw."""
+		if self.record is not None or self.open_challenge:
+			return
+		self.record = db.record_game(self.GAME, self.players[0].id, self.players[1].id, winner)
+
+	def with_record(self, line: str) -> str:
+		"""Puts the pair's record under a result line, once there is one."""
+		if self.record is None:
+			return line
+		first, second, ties = self.record
+		record = f"-# > Tally: {name_of(self.players[0])} **{first}** - **{second}** {name_of(self.players[1])}"
+		if ties:
+			record += f", {ties} tie" + ("s" if ties != 1 else "")
+		return f"{line}\n{record}"
+
 	def forfeit_row(self) -> discord.ui.ActionRow | None:
 		"""None once someone has forfeited, since there's nothing left to give up on."""
 		if self.forfeited_by is not None:
@@ -300,7 +319,7 @@ class GameView(discord.ui.LayoutView):
 		if self.forfeited_by is None:
 			return None
 		quitter, _ = self.players[self.forfeited_by], self.players[1 - self.forfeited_by]
-		return f"**{name_of(quitter)}** has forfeited the game."
+		return self.with_record(f"**{name_of(quitter)}** has forfeited the game.")
 
 	def disable_all(self):
 		for item in self.walk_children():
@@ -331,7 +350,7 @@ class GameView(discord.ui.LayoutView):
 
 class ForfeitButton(discord.ui.Button):
 	def __init__(self, disabled: bool = False):
-		super().__init__(label="Forfeit", style=discord.ButtonStyle.blurple, disabled=disabled)
+		super().__init__(label="Forfeit", style=discord.ButtonStyle.red, disabled=disabled)
 
 	async def callback(self, interaction: discord.Interaction):
 		game: GameView = self.view
@@ -345,6 +364,8 @@ class ForfeitButton(discord.ui.Button):
 		# an open challenge nobody joined has no winner to hand it to, so it just stops
 		game.forfeited_by = seat if not game.open_challenge else None
 		game.finish()
+		if game.forfeited_by is not None:
+			game.settle(1 - game.forfeited_by)
 		game.render()
 		game.disable_all()
 		await interaction.response.edit_message(view=game, allowed_mentions=discord.AllowedMentions.none())
@@ -378,6 +399,7 @@ class RPSButton(discord.ui.Button):
 
 class RPSView(GameView):
 	"""Both players pick a hand, then it reveals the winner."""
+	GAME = "rps"
 
 	def __init__(self, challenger: discord.User, opponent: discord.User | None):
 		super().__init__(challenger, opponent)
@@ -389,6 +411,7 @@ class RPSView(GameView):
 		done = all(p is not None for p in self.picks)
 		if done:
 			self.finish()
+			self.settle(rps_winner(*self.picks))
 
 		container = discord.ui.Container(accent_color=theme.COLOR_DARK if done or self.finished else theme.COLOR_MAIN)
 		container.add_item(discord.ui.TextDisplay(f"## ✊ Rock Paper Scissors\n{name_of(self.players[0])} vs {name_of(self.players[1])}"))
@@ -401,7 +424,7 @@ class RPSView(GameView):
 			first, second = self.picks
 			winner = rps_winner(first, second)
 			lines = [f"{name_of(self.players[0])} {RPS_CHOICES[first]}  ×  {RPS_CHOICES[second]} {name_of(self.players[1])}", ""]
-			lines.append("Game over, it's a draw." if winner is None else f"Game over, **{name_of(self.players[winner])}** wins!")
+			lines.append(self.with_record("Game over, it's a draw." if winner is None else f"Game over, **{name_of(self.players[winner])}** wins!"))
 			container.add_item(discord.ui.TextDisplay("\n".join(lines)))
 		elif self.ended_early:
 			container.add_item(discord.ui.TextDisplay(self.expired_text()))
@@ -442,6 +465,8 @@ class TicTacToeButton(discord.ui.Button):
 		await interaction.response.edit_message(view=game, allowed_mentions=game.ping_turn())
 
 class TicTacToeView(GameView):
+	GAME = "tictactoe"
+
 	def __init__(self, challenger: discord.User, opponent: discord.User | None):
 		super().__init__(challenger, opponent)
 		self.board: list[int | None] = [None]*9
@@ -453,6 +478,7 @@ class TicTacToeView(GameView):
 		full = all(square is not None for square in self.board)
 		if result is not None or full:
 			self.finish()
+			self.settle(result[0] if result is not None else None)
 
 		container = discord.ui.Container(accent_color=theme.COLOR_DARK if self.finished else theme.COLOR_MAIN)
 		header = f"## ⭕ Tic Tac Toe\n**{TTT_MARKS[0]}** {name_of(self.players[0])} vs **{TTT_MARKS[1]}** {name_of(self.players[1])}"
@@ -463,9 +489,9 @@ class TicTacToeView(GameView):
 		if gave_up is not None:
 			container.add_item(discord.ui.TextDisplay(gave_up))
 		elif result is not None:
-			container.add_item(discord.ui.TextDisplay(f"Game over, **{name_of(self.players[result[0]])}** wins!"))
+			container.add_item(discord.ui.TextDisplay(self.with_record(f"Game over, **{name_of(self.players[result[0]])}** wins!")))
 		elif full:
-			container.add_item(discord.ui.TextDisplay("Game over, it's a draw."))
+			container.add_item(discord.ui.TextDisplay(self.with_record("Game over, it's a draw.")))
 		else:
 			container.add_item(discord.ui.TextDisplay(self.expired_text() if self.ended_early
 				else f"**{TTT_MARKS[self.turn]}** {name_of(self.players[self.turn])}'s turn."))
@@ -504,6 +530,8 @@ class ConnectFourButton(discord.ui.Button):
 		await interaction.response.edit_message(view=game, allowed_mentions=game.ping_turn())
 
 class ConnectFourView(GameView):
+	GAME = "connectfour"
+
 	def __init__(self, challenger: discord.User, opponent: discord.User | None):
 		super().__init__(challenger, opponent)
 		self.board: list[list[int | None]] = [[None]*C4_COLUMNS for _ in range(C4_ROWS)]
@@ -515,6 +543,7 @@ class ConnectFourView(GameView):
 		full = board_full(self.board)
 		if winner is not None or full:
 			self.finish()
+			self.settle(winner)
 
 		container = discord.ui.Container(accent_color=theme.COLOR_DARK if self.finished else theme.COLOR_MAIN)
 		header = f"## 🧮 Connect Four\n{C4_DISCS[0]} {name_of(self.players[0])} vs {C4_DISCS[1]} {name_of(self.players[1])}"
@@ -528,9 +557,9 @@ class ConnectFourView(GameView):
 		if gave_up is not None:
 			container.add_item(discord.ui.TextDisplay(gave_up))
 		elif winner is not None:
-			container.add_item(discord.ui.TextDisplay(f"Game over, **{name_of(self.players[winner])}** wins!"))
+			container.add_item(discord.ui.TextDisplay(self.with_record(f"Game over, **{name_of(self.players[winner])}** wins!")))
 		elif full:
-			container.add_item(discord.ui.TextDisplay("Game over, it's a draw."))
+			container.add_item(discord.ui.TextDisplay(self.with_record("Game over, it's a draw.")))
 		else:
 			container.add_item(discord.ui.TextDisplay(self.expired_text() if self.ended_early
 				else f"{C4_DISCS[self.turn]} {name_of(self.players[self.turn])}'s turn."))
@@ -543,8 +572,10 @@ class ConnectFourView(GameView):
 					if self.finished:
 						button.disabled = True
 					row.add_item(button)
+				# the last row only has three columns, so forfeit fills the gap
+				if start == 4 and self.forfeited_by is None:
+					row.add_item(ForfeitButton(disabled=self.finished))
 				container.add_item(row)
-			self.add_forfeit_row(container)
 		self.add_item(container)
 
 ########## ======================================================================== ##########
@@ -815,6 +846,7 @@ class ShotCell(discord.ui.Button):
 		if all_sunk(game.setups[target].fleet, game.shots[target]):
 			game.winner = game.turn
 			game.finish()
+			game.settle(game.winner)
 		elif outcome == "miss":
 			game.turn = target
 		game.render()
@@ -822,6 +854,7 @@ class ShotCell(discord.ui.Button):
 
 class BattleshipView(GameView):
 	"""Both players lay out a fleet in private, then take turns shooting."""
+	GAME = "battleship"
 
 	def __init__(self, challenger: discord.User, opponent: discord.User | None):
 		super().__init__(challenger, opponent)
@@ -893,7 +926,7 @@ class BattleshipView(GameView):
 		gave_up = self.forfeit_text()
 		if self.winner is not None:
 			container.add_item(discord.ui.TextDisplay(
-				f"**{name_of(self.players[self.winner])}** sank the fleet and wins."))
+				self.with_record(f"**{name_of(self.players[self.winner])}** sank the fleet and wins.")))
 			if not self.placing:
 				container.add_item(discord.ui.Separator())
 				container.add_item(discord.ui.TextDisplay(self.recap()))

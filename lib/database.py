@@ -139,6 +139,16 @@ MIGRATIONS = [
 			linked_at TEXT NOT NULL
 		)""",
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_robloxaccounts_roblox ON RobloxAccounts(roblox_id)",
+	], [
+		"""CREATE TABLE IF NOT EXISTS GameRecords (
+			game TEXT NOT NULL,
+			player_low INTEGER NOT NULL,
+			player_high INTEGER NOT NULL,
+			low_wins INTEGER NOT NULL DEFAULT 0,
+			high_wins INTEGER NOT NULL DEFAULT 0,
+			ties INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (game, player_low, player_high)
+		)""",
 	],
 ]
 
@@ -666,3 +676,23 @@ def roblox_account_owner(roblox_id: int) -> int | None:
 def forget_roblox_friend(roblox_id: int):
 	cur.execute("DELETE FROM RobloxFriends WHERE roblox_id = ?", (roblox_id,))
 	conn.commit()
+
+####### ============================ game records ========================== #######
+
+def record_game(game: str, first: int, second: int, winner: int | None) -> tuple[int, int, int]:
+	"""Adds a result to a pair's record and returns it as (first's wins, second's wins, ties)."""
+	# the pair is stored lowest id first, so it's one row whoever challenged whom
+	flipped = first > second
+	low, high = (second, first) if flipped else (first, second)
+	low_won = winner is not None and (winner == 0) != flipped
+	high_won = winner is not None and not low_won
+	cur.execute(
+		"INSERT INTO GameRecords (game, player_low, player_high, low_wins, high_wins, ties) VALUES (?, ?, ?, ?, ?, ?) "
+		"ON CONFLICT(game, player_low, player_high) DO UPDATE SET low_wins = low_wins + excluded.low_wins, "
+		"high_wins = high_wins + excluded.high_wins, ties = ties + excluded.ties",
+		(game, low, high, int(low_won), int(high_won), int(winner is None)),
+	)
+	conn.commit()
+	cur.execute("SELECT low_wins, high_wins, ties FROM GameRecords WHERE game = ? AND player_low = ? AND player_high = ?", (game, low, high))
+	low_wins, high_wins, ties = cur.fetchone()
+	return (high_wins, low_wins, ties) if flipped else (low_wins, high_wins, ties)
